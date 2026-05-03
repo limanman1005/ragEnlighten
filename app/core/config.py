@@ -8,10 +8,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # OpenAI
-    openai_api_key: str = ""
-    openai_llm_model: str = "gpt-4o-mini"
+    # LLM
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.deepseek.com/v1"
+    llm_model: str = "deepseek-chat"
+
+    # Embeddings
     openai_embedding_model: str = "text-embedding-3-small"
+    openai_api_key: str = ""
 
     # Vector store
     chroma_persist_dir: str = "./chroma_db"

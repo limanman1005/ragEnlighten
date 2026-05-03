@@ -56,9 +56,10 @@ class RAGState(TypedDict):
 
 def _get_llm() -> ChatOpenAI:
     return ChatOpenAI(
-        model=settings.openai_llm_model,
+        model=settings.llm_model,
         temperature=0,
-        openai_api_key=settings.openai_api_key,
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
     )
 
 

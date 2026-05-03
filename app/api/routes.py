@@ -38,7 +38,7 @@ async def health_check() -> HealthResponse:
     return HealthResponse(
         status="ok",
         details={
-            "llm_model": settings.openai_llm_model,
+            "llm_model": settings.llm_model,
             "embedding_model": settings.openai_embedding_model,
             "vector_store": settings.chroma_persist_dir,
         },
