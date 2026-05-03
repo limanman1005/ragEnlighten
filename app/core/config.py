@@ -42,9 +42,12 @@ class Settings(BaseSettings):
 
     # Retriever
     retriever_top_k: int = 4
+    retrieval_max_hops: int = 2
+    min_relevant_chunks_to_answer: int = 2
 
     # Content preview lengths
     grade_context_chars: int = 500   # chars of each chunk sent to the relevance grader
+    rewrite_context_chars: int = 800
     source_preview_chars: int = 300  # chars shown per source in query responses
 
     # FastAPI
