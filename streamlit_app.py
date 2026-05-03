@@ -119,6 +119,10 @@ def _render_sources(sources: list[dict[str, Any]]) -> None:
             if retrieval_score is not None:
                 summary.append(f"score {float(retrieval_score):.4f}")
             st.markdown(f"**{' | '.join(summary)}**")
+            if source.get("section_path"):
+                st.caption(f"Section path: {source['section_path']}")
+            if source.get("parent_chunk_id"):
+                st.caption(f"Parent chunk: {source['parent_chunk_id']}")
             st.write(source.get("content", ""))
 
 

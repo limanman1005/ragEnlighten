@@ -36,6 +36,8 @@ class SourceDocument(BaseModel):
 
     source: str = Field(default="", description="Source file or URL")
     page: int | None = Field(default=None, description="Page number (if available)")
+    section_path: str | None = Field(default=None, description="Hierarchical section path for this chunk")
+    parent_chunk_id: str | None = Field(default=None, description="Parent chunk identifier for this child chunk")
     retrieval_score: float | None = Field(
         default=None,
         description="Similarity score returned by the vector retrieval stage",
