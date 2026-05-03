@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 
 from app.core.config import settings
@@ -25,6 +27,7 @@ from app.services.indexing import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +42,7 @@ async def health_check() -> HealthResponse:
         status="ok",
         details={
             "llm_model": settings.llm_model,
-            "embedding_model": settings.openai_embedding_model,
+            "embedding_model": settings.embedding_model,
             "vector_store": settings.chroma_persist_dir,
         },
     )
@@ -61,8 +64,14 @@ async def upload_document(
     collection_name: str | None = Form(default=None, description="Target collection name"),
 ) -> IndexResponse:
     """Upload a file and index its content into the vector store."""
+    logger.info(
+        "[documents.upload] start filename=%s collection=%s",
+        file.filename,
+        collection_name or settings.chroma_collection_name,
+    )
     content = await file.read()
     if not content:
+        logger.warning("[documents.upload] rejected empty file filename=%s", file.filename)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Uploaded file is empty.",
@@ -70,12 +79,19 @@ async def upload_document(
     try:
         num_chunks = index_file(content, file.filename or "upload", collection_name)
     except ValueError as exc:
+        logger.exception("[documents.upload] indexing failed filename=%s", file.filename)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
 
     col = collection_name or settings.chroma_collection_name
+    logger.info(
+        "[documents.upload] complete filename=%s collection=%s chunks=%s",
+        file.filename,
+        col,
+        num_chunks,
+    )
     return IndexResponse(
         message=f"File '{file.filename}' indexed successfully.",
         num_chunks=num_chunks,
@@ -95,13 +111,26 @@ async def index_text_document(
     collection_name: str | None = Form(default=None, description="Target collection name"),
 ) -> IndexResponse:
     """Index a plain-text snippet directly (no file upload required)."""
+    logger.info(
+        "[documents.text] start source=%s collection=%s text_chars=%s",
+        source,
+        collection_name or settings.chroma_collection_name,
+        len(text),
+    )
     if not text.strip():
+        logger.warning("[documents.text] rejected empty text source=%s", source)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Text content is empty.",
         )
     num_chunks = index_text(text, source=source, collection_name=collection_name)
     col = collection_name or settings.chroma_collection_name
+    logger.info(
+        "[documents.text] complete source=%s collection=%s chunks=%s",
+        source,
+        col,
+        num_chunks,
+    )
     return IndexResponse(
         message="Text indexed successfully.",
         num_chunks=num_chunks,
@@ -125,18 +154,26 @@ async def remove_document(
 ) -> DeleteResponse:
     """Delete a document chunk by its vector-store ID."""
     collection_name = body.collection_name if body else None
+    logger.info(
+        "[documents.delete] start doc_id=%s collection=%s",
+        doc_id,
+        collection_name or settings.chroma_collection_name,
+    )
     try:
         delete_document(doc_id, collection_name)
     except (ValueError, KeyError) as exc:
+        logger.exception("[documents.delete] document not found doc_id=%s", doc_id)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Document not found: {doc_id}",
         ) from exc
     except RuntimeError as exc:
+        logger.exception("[documents.delete] delete failed doc_id=%s", doc_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An internal error occurred while deleting the document.",
         ) from exc
+    logger.info("[documents.delete] complete doc_id=%s", doc_id)
     return DeleteResponse(message="Document deleted successfully.", doc_id=doc_id)
 
 
@@ -174,6 +211,11 @@ async def query(body: QueryRequest) -> QueryResponse:
     The request is routed through the LangGraph workflow:
     retrieve → grade → generate (or fallback if no relevant docs found).
     """
+    logger.info(
+        "[rag.query] start collection=%s question=%s",
+        body.collection_name or settings.chroma_collection_name,
+        body.question[:120],
+    )
     graph = get_rag_graph()
 
     initial_state = {
@@ -186,6 +228,7 @@ async def query(body: QueryRequest) -> QueryResponse:
     try:
         final_state = await graph.ainvoke(initial_state)
     except Exception as exc:
+        logger.exception("[rag.query] graph failed collection=%s", body.collection_name)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"RAG pipeline error: {exc}",
@@ -200,8 +243,15 @@ async def query(body: QueryRequest) -> QueryResponse:
         for doc in final_state.get("documents", [])
     ]
 
-    return QueryResponse(
+    response = QueryResponse(
         question=body.question,
         answer=final_state["answer"],
         sources=sources,
     )
+    logger.info(
+        "[rag.query] complete collection=%s sources=%s answer_chars=%s",
+        body.collection_name or settings.chroma_collection_name,
+        len(sources),
+        len(response.answer),
+    )
+    return response

@@ -2,7 +2,7 @@
 
 基于 **LangChain**、**LangGraph** 和 **FastAPI** 构建的 Agentic RAG（检索增强生成）系统。
 
-默认使用 **DeepSeek** 作为问答大模型，使用 OpenAI Embeddings 进行向量化。
+默认使用 **DeepSeek** 作为问答大模型，使用阿里云百炼兼容 OpenAI 接口的 Embedding 模型进行向量化。
 
 ---
 
@@ -74,7 +74,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填写 LLM_API_KEY / OPENAI_API_KEY 等配置
+# 编辑 .env，填写 LLM_API_KEY / EMBEDDING_API_KEY 等配置
 ```
 
 ### 3. 启动服务
@@ -124,8 +124,10 @@ curl -X POST http://localhost:8000/api/v1/query \
 | `LLM_API_KEY` | _(必填)_ | DeepSeek API 密钥，用于问答和相关性评分 |
 | `LLM_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek OpenAI-compatible API 地址 |
 | `LLM_MODEL` | `deepseek-chat` | 问答模型 |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | 嵌入模型 |
-| `OPENAI_API_KEY` | _(索引时必填)_ | OpenAI API 密钥，用于文档向量化 |
+| `EMBEDDING_API_KEY` | _(索引时必填)_ | 阿里云百炼 API Key；也兼容读取 `DASHSCOPE_API_KEY` |
+| `EMBEDDING_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 百炼 OpenAI 兼容接口地址 |
+| `EMBEDDING_MODEL` | `text-embedding-v4` | 文本向量模型 |
+| `EMBEDDING_DIMENSIONS` | `1024` | 向量维度；可按百炼支持范围调整 |
 | `CHROMA_PERSIST_DIR` | `./chroma_db` | Chroma 向量库持久化目录 |
 | `RETRIEVER_TOP_K` | `4` | 每次检索返回的最大文档块数 |
 | `APP_HOST` | `0.0.0.0` | 服务监听地址 |

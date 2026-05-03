@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# chromea_db directory for vector store persistence
+chroma_db/
