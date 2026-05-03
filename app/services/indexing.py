@@ -60,8 +60,8 @@ _CHUNKING_PROFILES: dict[str, dict[str, object]] = {
         "separators": ["\n\n", "\n", "。", "；", ". ", "; ", " ", ""],
         "parent_size": 1800,
         "parent_overlap": 240,
-        "child_size": 600,
-        "child_overlap": 100,
+        "child_size": 200,
+        "child_overlap": 50,
     },
     "docx": {
         "separators": ["\n\n", "\n", "。", ". ", "; ", " ", ""],

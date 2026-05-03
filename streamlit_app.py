@@ -333,6 +333,50 @@ def _render_chunks(payload: dict[str, Any]) -> None:
         if chunk.get("chunk_level"):
             title_parts.append(str(chunk["chunk_level"]))
         with st.expander(" | ".join(title_parts), expanded=False):
+            source_value = str(chunk.get("source") or "").strip()
+            action_cols = st.columns(2)
+            if action_cols[0].button(
+                "Use this source as filter",
+                key=f"chunk-filter-{chunk.get('id')}",
+                use_container_width=True,
+                disabled=not source_value,
+            ):
+                st.session_state.chunk_browser["source_filter"] = source_value
+                st.session_state.chunk_browser["offset"] = 0
+                st.rerun()
+            if action_cols[1].button(
+                "Delete this source",
+                key=f"chunk-delete-{chunk.get('id')}",
+                use_container_width=True,
+                type="secondary",
+                disabled=not source_value,
+            ):
+                try:
+                    with st.spinner("Deleting vector data from the selected collection..."):
+                        delete_result = _delete_chunks_by_source(
+                            DEFAULT_BACKEND_URL if not st.session_state.get("_active_backend_url") else st.session_state["_active_backend_url"],
+                            source_value,
+                            payload.get("collection_name") or None,
+                        )
+                    st.session_state.chunk_browser["source_filter"] = source_value
+                    st.session_state.chunk_browser["offset"] = 0
+                    st.session_state.chunk_browser["payload"] = _fetch_chunks(
+                        DEFAULT_BACKEND_URL if not st.session_state.get("_active_backend_url") else st.session_state["_active_backend_url"],
+                        payload.get("collection_name") or None,
+                        int(st.session_state.chunk_browser.get("limit", 20)),
+                        0,
+                        source_value,
+                    )
+                    st.session_state.collection_names = _fetch_collections(
+                        DEFAULT_BACKEND_URL if not st.session_state.get("_active_backend_url") else st.session_state["_active_backend_url"]
+                    )
+                    st.success(
+                        f"Deleted {delete_result['deleted_count']} chunks for source '{delete_result['source']}'."
+                    )
+                    st.rerun()
+                except requests.RequestException as exc:
+                    details = exc.response.text if exc.response is not None else str(exc)
+                    st.error(f"Delete failed: {details}")
             meta_cols = st.columns(3)
             meta_cols[0].caption(f"Page: {chunk.get('page') or 'n/a'}")
             meta_cols[1].caption(f"Section: {chunk.get('section_path') or 'root'}")
@@ -378,6 +422,7 @@ st.caption("Upload files into the knowledge base and ask grounded questions agai
 with st.sidebar:
     st.header("Backend")
     backend_url = st.text_input("FastAPI base URL", value=DEFAULT_BACKEND_URL)
+    st.session_state["_active_backend_url"] = backend_url
     chat_mode = st.radio(
         "Chat mode",
         options=["LangGraph", "React Agent"],
