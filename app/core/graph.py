@@ -48,13 +48,61 @@ class RAGState(TypedDict):
 
     question: str
     collection_name: str | None
+    current_query: str
+    query_variants: list[str]
+    candidate_documents: list[Document]
     documents: list[Document]
     answer: str
     trace: list[str]
+    retrieval_hop: int
 
 
 def _append_trace(state: RAGState, message: str) -> list[str]:
-    return [*state.get("trace", []), message]
+    trace = [*state.get("trace", [])]
+    trace.append(f"{len(trace) + 1}. {message}")
+    return trace
+
+
+def _merge_documents(existing: list[Document], incoming: list[Document]) -> list[Document]:
+    merged = list(existing)
+    index_by_key = {
+        (
+            doc.metadata.get("source"),
+            doc.metadata.get("page"),
+            doc.metadata.get("start_index"),
+            doc.page_content,
+        ): idx
+        for idx, doc in enumerate(merged)
+    }
+
+    for doc in incoming:
+        key = (
+            doc.metadata.get("source"),
+            doc.metadata.get("page"),
+            doc.metadata.get("start_index"),
+            doc.page_content,
+        )
+        existing_index = index_by_key.get(key)
+        if existing_index is None:
+            index_by_key[key] = len(merged)
+            merged.append(doc)
+            continue
+
+        existing_score = merged[existing_index].metadata.get("retrieval_score")
+        incoming_score = doc.metadata.get("retrieval_score")
+        if incoming_score is not None and (
+            existing_score is None or float(incoming_score) > float(existing_score)
+        ):
+            merged[existing_index] = doc
+
+    return merged
+
+
+def _normalize_rewritten_query(candidate: str, fallback: str) -> str:
+    cleaned = candidate.strip()
+    if not cleaned or cleaned.lower() in {"none", "n/a", "no additional query", "null"}:
+        return fallback
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +119,74 @@ def _get_llm() -> ChatOpenAI:
     )
 
 
+def rewrite_query(state: RAGState) -> RAGState:
+    """Rewrite the user question into a retrieval-friendly query for the current hop."""
+    next_hop = state.get("retrieval_hop", 0) + 1
+    trace = _append_trace(state, f"Preparing retrieval query for hop {next_hop}")
+    llm = _get_llm()
+
+    context = "\n\n---\n\n".join(
+        doc.page_content[: settings.rewrite_context_chars]
+        for doc in state.get("documents", [])
+    )
+
+    if state.get("documents"):
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    (
+                        "You are a retrieval planner. "
+                        "Given the original user question and the relevant context already found, "
+                        "write one concise follow-up search query that can fill the remaining knowledge gap. "
+                        "Return only the rewritten search query."
+                    ),
+                ),
+                (
+                    "human",
+                    (
+                        "Original question: {question}\n\n"
+                        "Relevant context already found:\n{context}\n\n"
+                        "Follow-up search query:"
+                    ),
+                ),
+            ]
+        )
+        rewritten_query = (prompt | llm | StrOutputParser()).invoke(
+            {"question": state["question"], "context": context or "(none)"}
+        ).strip()
+    else:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    (
+                        "You are a retrieval query rewriter. "
+                        "Rewrite the user's question into one concise search query optimized for document retrieval. "
+                        "Keep the meaning unchanged and return only the rewritten query."
+                    ),
+                ),
+                (
+                    "human",
+                    "User question: {question}\n\nRetrieval query:",
+                ),
+            ]
+        )
+        rewritten_query = (prompt | llm | StrOutputParser()).invoke(
+            {"question": state["question"]}
+        ).strip()
+
+    current_query = _normalize_rewritten_query(rewritten_query, state["question"])
+    logger.info("[rag.rewrite] hop=%s query=%s", next_hop, current_query[:200])
+    trace.append(f"{len(trace) + 1}. Retrieval query for hop {next_hop}: {current_query}")
+    return {
+        **state,
+        "current_query": current_query,
+        "query_variants": [*state.get("query_variants", []), current_query],
+        "trace": trace,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
@@ -78,18 +194,35 @@ def _get_llm() -> ChatOpenAI:
 
 def retrieve(state: RAGState) -> RAGState:
     """Retrieve the top-k most relevant chunks from the vector store."""
-    trace = _append_trace(state, "1. Retrieving relevant document chunks from the vector store")
+    current_hop = state.get("retrieval_hop", 0) + 1
+    trace = _append_trace(state, f"Running retrieval hop {current_hop}")
     logger.info(
-        "[rag.retrieve] start collection=%s question=%s",
+        "[rag.retrieve] start collection=%s hop=%s query=%s",
         state.get("collection_name") or settings.chroma_collection_name,
-        state["question"][:120],
+        current_hop,
+        state.get("current_query", state["question"])[:120],
     )
     vs = get_vectorstore(state.get("collection_name"))
-    retriever = vs.as_retriever(search_kwargs={"k": settings.retriever_top_k})
-    docs = retriever.invoke(state["question"])
-    logger.info("[rag.retrieve] complete docs=%s", len(docs))
-    trace.append(f"2. Retrieval complete: {len(docs)} candidate chunks found")
-    return {**state, "documents": docs, "trace": trace}
+    scored_docs = vs.similarity_search_with_relevance_scores(
+        state.get("current_query") or state["question"],
+        k=settings.retriever_top_k,
+    )
+    docs: list[Document] = []
+    scores: list[str] = []
+    for doc, score in scored_docs:
+        doc.metadata["retrieval_score"] = round(float(score), 4)
+        doc.metadata["retrieval_hop"] = current_hop
+        doc.metadata["retrieval_query"] = state.get("current_query") or state["question"]
+        docs.append(doc)
+        scores.append(f"{float(score):.4f}")
+
+    logger.info("[rag.retrieve] complete docs=%s scores=%s", len(docs), scores)
+    trace.append(
+        f"{len(trace) + 1}. Retrieval hop {current_hop} complete: {len(docs)} candidate chunks found"
+    )
+    if scores:
+        trace.append(f"{len(trace) + 1}. Retrieval hop {current_hop} scores: {', '.join(scores)}")
+    return {**state, "candidate_documents": docs, "retrieval_hop": current_hop, "trace": trace}
 
 
 def grade_docs(state: RAGState) -> RAGState:
@@ -100,9 +233,9 @@ def grade_docs(state: RAGState) -> RAGState:
     """
     llm = _get_llm()
     question = state["question"]
-    relevant: list[Document] = []
-    trace = _append_trace(state, "3. Grading retrieved chunks for relevance")
-    logger.info("[rag.grade] start docs=%s", len(state["documents"]))
+    hop_relevant: list[Document] = []
+    trace = _append_trace(state, f"Grading retrieval hop {state['retrieval_hop']} for relevance")
+    logger.info("[rag.grade] start docs=%s", len(state["candidate_documents"]))
 
     grade_prompt = ChatPromptTemplate.from_messages(
         [
@@ -126,7 +259,7 @@ def grade_docs(state: RAGState) -> RAGState:
         ]
     )
 
-    for doc in state["documents"]:
+    for doc in state["candidate_documents"]:
         messages = grade_prompt.format_messages(
             question=question,
             content=doc.page_content[: settings.grade_context_chars],
@@ -134,21 +267,26 @@ def grade_docs(state: RAGState) -> RAGState:
         response = llm.invoke(messages)
         verdict = response.content.strip().lower()
         logger.info(
-            "[rag.grade] verdict=%s source=%s",
+            "[rag.grade] verdict=%s source=%s score=%s",
             verdict,
             doc.metadata.get("source", "unknown"),
+            doc.metadata.get("retrieval_score"),
         )
         if verdict.startswith("yes"):
-            relevant.append(doc)
+            hop_relevant.append(doc)
 
-    logger.info("[rag.grade] complete relevant_docs=%s", len(relevant))
-    trace.append(f"4. Relevance grading complete: {len(relevant)} chunks kept")
-    return {**state, "documents": relevant, "trace": trace}
+    documents = _merge_documents(state.get("documents", []), hop_relevant)
+    logger.info("[rag.grade] complete relevant_docs=%s", len(documents))
+    trace.append(
+        f"{len(trace) + 1}. Hop {state['retrieval_hop']} grading complete: "
+        f"{len(hop_relevant)} chunks kept in this hop, {len(documents)} unique chunks total"
+    )
+    return {**state, "documents": documents, "candidate_documents": [], "trace": trace}
 
 
 def generate(state: RAGState) -> RAGState:
     """Generate an answer using the graded documents as context."""
-    trace = _append_trace(state, "5. Generating grounded answer from relevant chunks")
+    trace = _append_trace(state, "Generating grounded answer from relevant chunks")
     logger.info("[rag.generate] start docs=%s", len(state["documents"]))
     llm = _get_llm()
     context = "\n\n---\n\n".join(doc.page_content for doc in state["documents"])
@@ -177,13 +315,13 @@ def generate(state: RAGState) -> RAGState:
     chain = prompt | llm | StrOutputParser()
     answer = chain.invoke({"context": context, "question": state["question"]})
     logger.info("[rag.generate] complete answer_chars=%s", len(answer))
-    trace.append("6. Answer generation complete")
+    trace.append(f"{len(trace) + 1}. Answer generation complete")
     return {**state, "answer": answer, "trace": trace}
 
 
 def no_answer(state: RAGState) -> RAGState:
     """Return a polite fallback when no relevant documents were found."""
-    trace = _append_trace(state, "5. No relevant chunks remained after grading")
+    trace = _append_trace(state, "No relevant chunks remained after grading")
     logger.info("[rag.no_answer] no relevant documents found")
     return {
         **state,
@@ -191,7 +329,7 @@ def no_answer(state: RAGState) -> RAGState:
             "I could not find any relevant information in the knowledge base "
             "to answer your question."
         ),
-        "trace": [*trace, "6. Returned fallback response"],
+        "trace": [*trace, f"{len(trace) + 1}. Returned fallback response"],
     }
 
 
@@ -202,7 +340,14 @@ def no_answer(state: RAGState) -> RAGState:
 
 def _route_after_grading(state: RAGState) -> str:
     """Decide whether to generate an answer or return a fallback."""
-    return "generate" if state["documents"] else "no_answer"
+    relevant_docs = len(state["documents"])
+    current_hop = state.get("retrieval_hop", 0)
+
+    if relevant_docs >= settings.min_relevant_chunks_to_answer:
+        return "generate"
+    if current_hop < settings.retrieval_max_hops:
+        return "rewrite_query"
+    return "generate" if relevant_docs else "no_answer"
 
 
 # ---------------------------------------------------------------------------
@@ -215,17 +360,20 @@ def build_rag_graph() -> StateGraph:
     logger.info("[rag.graph] building graph")
     graph = StateGraph(RAGState)
 
+    graph.add_node("rewrite_query", rewrite_query)
     graph.add_node("retrieve", retrieve)
     graph.add_node("grade_docs", grade_docs)
     graph.add_node("generate", generate)
     graph.add_node("no_answer", no_answer)
 
-    graph.add_edge(START, "retrieve")
+    graph.add_edge(START, "rewrite_query")
+    graph.add_edge("rewrite_query", "retrieve")
     graph.add_edge("retrieve", "grade_docs")
     graph.add_conditional_edges(
         "grade_docs",
         _route_after_grading,
         {
+            "rewrite_query": "rewrite_query",
             "generate": "generate",
             "no_answer": "no_answer",
         },

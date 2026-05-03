@@ -12,7 +12,7 @@
 |------|------|
 | 文档上传与索引 | 支持 PDF、DOCX、TXT、Markdown 文件，自动切分并向量化存储（Chroma） |
 | 文本直接索引 | 可将纯文本片段直接写入知识库 |
-| Agentic RAG 问答 | 基于 LangGraph 的三步流水线：检索 → 相关性评分 → 生成 |
+| Agentic RAG 问答 | 基于 LangGraph 的多步流水线：查询改写 → 检索 → 相关性评分 → 多跳补充检索 → 生成 |
 | 多集合管理 | 支持按集合（collection）组织不同领域的知识库 |
 | OpenAPI 文档 | FastAPI 自动生成交互式 Swagger UI（`/docs`）和 ReDoc（`/redoc`） |
 
@@ -51,7 +51,9 @@ START
   ▼
 [grade_docs] ── 使用 LLM 过滤不相关文档
   │
-  ├─ 无相关文档 ──▶ [no_answer] ──▶ END
+  ├─ 相关文档不足且未达到最大 hop ──▶ [rewrite_query] ──▶ [retrieve]
+  │
+  ├─ 无相关文档且达到最大 hop ──▶ [no_answer] ──▶ END
   │
   ▼
 [generate]   ── 基于相关文档生成回答
@@ -90,8 +92,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ### 4. 启动 Streamlit 前端
 
 ```bash
-streamlit run streamlit_app.py
+c:/Users/liman/githubProject/ragEnlighten/.venv/Scripts/python.exe -m streamlit run streamlit_app.py
 ```
+
+如果你已经先激活了 `.venv`，也可以直接执行 `streamlit run streamlit_app.py`。
 
 默认会连接 `http://127.0.0.1:8004/api/v1`，也可以在页面侧边栏里改成你当前 FastAPI 服务的地址。
 

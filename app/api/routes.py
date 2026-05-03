@@ -221,9 +221,13 @@ async def query(body: QueryRequest) -> QueryResponse:
     initial_state = {
         "question": body.question,
         "collection_name": body.collection_name,
+        "current_query": body.question,
+        "query_variants": [],
+        "candidate_documents": [],
         "documents": [],
         "answer": "",
-        "trace": ["0. Query accepted by API"],
+        "trace": ["1. Query accepted by API"],
+        "retrieval_hop": 0,
     }
 
     try:
@@ -239,6 +243,8 @@ async def query(body: QueryRequest) -> QueryResponse:
         SourceDocument(
             source=doc.metadata.get("source", ""),
             page=doc.metadata.get("page"),
+            retrieval_score=doc.metadata.get("retrieval_score"),
+            retrieval_hop=doc.metadata.get("retrieval_hop"),
             content=doc.page_content[: settings.source_preview_chars],
         )
         for doc in final_state.get("documents", [])

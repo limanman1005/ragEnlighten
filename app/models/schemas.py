@@ -36,6 +36,14 @@ class SourceDocument(BaseModel):
 
     source: str = Field(default="", description="Source file or URL")
     page: int | None = Field(default=None, description="Page number (if available)")
+    retrieval_score: float | None = Field(
+        default=None,
+        description="Similarity score returned by the vector retrieval stage",
+    )
+    retrieval_hop: int | None = Field(
+        default=None,
+        description="The retrieval hop that surfaced this chunk",
+    )
     content: str = Field(description="Text excerpt of the retrieved chunk")
 
 
