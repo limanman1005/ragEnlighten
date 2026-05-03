@@ -158,7 +158,40 @@ def _extract_json_object(text: str) -> dict[str, object]:
 
 def _heuristic_classification(question: str) -> dict[str, object]:
     lower = question.lower()
-    internal_keywords = ["collection", "collections", "health", "status", "model", "embedding", "配置", "集合", "模型"]
+    internal_keywords = [
+        "collection",
+        "collections",
+        "health",
+        "status",
+        "embedding model",
+        "llm model",
+        "api status",
+        "system config",
+        "服务状态",
+        "接口状态",
+        "系统配置",
+        "当前模型",
+        "embedding配置",
+        "集合列表",
+    ]
+    profile_keywords = [
+        "简历",
+        "工作经历",
+        "教育经历",
+        "岗位",
+        "任职",
+        "项目经历",
+        "人物",
+        "人员",
+        "履历",
+        "software engineer",
+        "developer",
+        "experience",
+        "employment",
+        "resume",
+        "profile",
+        "bio",
+    ]
     high_risk_keywords = [
         "付款",
         "转账",
@@ -183,7 +216,12 @@ def _heuristic_classification(question: str) -> dict[str, object]:
     else:
         question_type = "document_qa"
 
-    route = "internal_api" if any(keyword in lower for keyword in internal_keywords) else "rag"
+    mentions_profile = any(keyword in lower for keyword in profile_keywords) or (
+        bool(re.search(r"[\u4e00-\u9fff]{2,4}", question))
+        and any(keyword in lower for keyword in ["工作", "经历", "负责", "做什么", "谁", "任职"])
+    )
+    asks_internal_meta = any(keyword in lower for keyword in internal_keywords)
+    route = "rag" if mentions_profile else ("internal_api" if asks_internal_meta else "rag")
     risk_level = "high" if any(keyword.lower() in lower for keyword in high_risk_keywords) else "low"
     return {
         "question_type": question_type,
@@ -238,6 +276,8 @@ def classify_question(state: RAGState) -> RAGState:
     question_type = str(payload.get("question_type") or fallback["question_type"])
     route = str(payload.get("route") or fallback["route"])
     risk_level = str(payload.get("risk_level") or fallback["risk_level"])
+    if fallback["route"] == "rag":
+        route = "rag"
     needs_human_review = bool(payload.get("needs_human_review", risk_level == "high"))
     trace.append(
         f"{len(trace) + 1}. Classified as type={question_type}, route={route}, risk={risk_level}"
@@ -433,12 +473,14 @@ def retrieve(state: RAGState) -> RAGState:
     )
     docs: list[Document] = []
     scores: list[str] = []
+    section_paths: list[str] = []
     for doc, score in scored_docs:
         doc.metadata["retrieval_score"] = round(float(score), 4)
         doc.metadata["retrieval_hop"] = current_hop
         doc.metadata["retrieval_query"] = state.get("current_query") or state["question"]
         docs.append(doc)
         scores.append(f"{float(score):.4f}")
+        section_paths.append(str(doc.metadata.get("section_path") or "root"))
 
     tool_calls = _append_tool_call(
         state,
@@ -447,12 +489,21 @@ def retrieve(state: RAGState) -> RAGState:
         input_summary=(state.get("current_query") or state["question"])[:120],
         output_summary=f"Retrieved {len(docs)} chunks in hop {current_hop}",
     )
-    logger.info("[rag.retrieve] complete docs=%s scores=%s", len(docs), scores)
+    logger.info(
+        "[rag.retrieve] complete docs=%s scores=%s sections=%s",
+        len(docs),
+        scores,
+        section_paths,
+    )
     trace.append(
         f"{len(trace) + 1}. Retrieval hop {current_hop} complete: {len(docs)} candidate chunks found"
     )
     if scores:
         trace.append(f"{len(trace) + 1}. Retrieval hop {current_hop} scores: {', '.join(scores)}")
+    if section_paths:
+        trace.append(
+            f"{len(trace) + 1}. Retrieval hop {current_hop} sections: {' | '.join(section_paths[:4])}"
+        )
     return {
         **state,
         "candidate_documents": docs,
@@ -504,10 +555,11 @@ def grade_docs(state: RAGState) -> RAGState:
         response = llm.invoke(messages)
         verdict = response.content.strip().lower()
         logger.info(
-            "[rag.grade] verdict=%s source=%s score=%s",
+            "[rag.grade] verdict=%s source=%s score=%s section=%s",
             verdict,
             doc.metadata.get("source", "unknown"),
             doc.metadata.get("retrieval_score"),
+            doc.metadata.get("section_path", "root"),
         )
         if verdict.startswith("yes"):
             hop_relevant.append(doc)

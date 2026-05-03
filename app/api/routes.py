@@ -259,9 +259,11 @@ async def query(body: QueryRequest) -> QueryResponse:
         SourceDocument(
             source=doc.metadata.get("source", ""),
             page=doc.metadata.get("page"),
+            section_path=doc.metadata.get("section_path"),
+            parent_chunk_id=doc.metadata.get("parent_chunk_id"),
             retrieval_score=doc.metadata.get("retrieval_score"),
             retrieval_hop=doc.metadata.get("retrieval_hop"),
-            content=doc.page_content[: settings.source_preview_chars],
+            content=(doc.metadata.get("content_preview") or doc.page_content)[: settings.source_preview_chars],
         )
         for doc in final_state.get("documents", [])
     ]

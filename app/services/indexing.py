@@ -6,8 +6,10 @@ Chroma vector store.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from langchain_core.documents import Document
@@ -36,6 +38,240 @@ _EXTENSION_LOADERS: dict[str, type] = {
     ".txt": TextLoader,
     ".md": UnstructuredMarkdownLoader,
 }
+
+_MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+_CHAPTER_HEADING_RE = re.compile(r"^(第[\d一二三四五六七八九十百千]+[章节部篇卷]|[一二三四五六七八九十]+、)\s*(.*\S)?$")
+_NUMBERED_HEADING_RE = re.compile(r"^(\d+(?:\.\d+){0,3})[\s、.．-]+(.*\S)$")
+_YEAR_RANGE_HEADING_RE = re.compile(
+    r"^((?:19|20)\d{2})(?:\s*[-/~至]\s*((?:19|20)\d{2}|至今|present|Present))?(?:\s*[|｜·•-]\s*.*)?$"
+)
+_SECTION_BREAK_RE = re.compile(r"\n(?:目录|contents)\b.*?(?=\n\S|$)", re.IGNORECASE | re.DOTALL)
+
+
+def _detect_source_type(metadata: dict[str, object]) -> str:
+    source_type = str(metadata.get("source_type", "")).strip().lower()
+    if source_type:
+        return source_type
+    source = str(metadata.get("source", "")).lower()
+    suffix = Path(source).suffix.lower().lstrip(".")
+    return suffix or "text"
+
+
+def _clean_text(text: str, source_type: str) -> str:
+    cleaned = text.replace("\x00", " ").replace("\ufeff", "")
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = cleaned.replace("\t", "    ")
+    cleaned = _SECTION_BREAK_RE.sub("\n", cleaned)
+    cleaned = re.sub(r"[ \u3000]+", " ", cleaned)
+    cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    if source_type in {"pdf", "docx", "txt", "text"}:
+        cleaned = re.sub(r"(?<![\n])\n(?=[^\n•\-\d#])", " ", cleaned)
+        cleaned = re.sub(r" {2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    return cleaned.strip()
+
+
+def _infer_heading(line: str, source_type: str) -> tuple[int, str] | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    if source_type == "md":
+        match = _MARKDOWN_HEADING_RE.match(stripped)
+        if match:
+            return len(match.group(1)), match.group(2).strip()
+        return None
+
+    match = _CHAPTER_HEADING_RE.match(stripped)
+    if match:
+        title = stripped if not match.group(2) else f"{match.group(1)} {match.group(2).strip()}"
+        return 1, title.strip()
+
+    match = _NUMBERED_HEADING_RE.match(stripped)
+    if match:
+        level = min(match.group(1).count(".") + 1, 4)
+        return level, stripped
+
+    match = _YEAR_RANGE_HEADING_RE.match(stripped)
+    if match and len(stripped) <= 60:
+        return 3, stripped
+
+    if len(stripped) <= 40 and stripped == stripped.title() and stripped[-1] not in ".。:：;；!?！？":
+        return 2, stripped
+
+    return None
+
+
+def _build_section_documents(docs: list[Document]) -> list[Document]:
+    section_docs: list[Document] = []
+
+    for doc_index, doc in enumerate(docs):
+        source_type = _detect_source_type(doc.metadata)
+        cleaned_text = _clean_text(doc.page_content, source_type)
+        if not cleaned_text:
+            continue
+
+        heading_stack: list[str] = []
+        current_buffer: list[str] = []
+        current_section_path = doc.metadata.get("section_path") or "root"
+
+        def flush_section() -> None:
+            nonlocal current_buffer
+            section_text = "\n".join(current_buffer).strip()
+            if not section_text:
+                current_buffer = []
+                return
+
+            metadata = dict(doc.metadata)
+            metadata["source_type"] = source_type
+            metadata["layout_parser"] = "markdown-headings" if source_type == "md" else "heuristic-layout"
+            metadata["section_path"] = current_section_path
+            metadata["document_index"] = doc_index
+            metadata["cleaned_chars"] = len(section_text)
+            section_docs.append(Document(page_content=section_text, metadata=metadata))
+            current_buffer = []
+
+        for raw_line in cleaned_text.split("\n"):
+            stripped = raw_line.strip()
+            heading = _infer_heading(stripped, source_type)
+            if heading:
+                flush_section()
+                level, title = heading
+                while len(heading_stack) >= level:
+                    heading_stack.pop()
+                heading_stack.append(title)
+                current_section_path = "/".join(heading_stack) if heading_stack else "root"
+                continue
+
+            current_buffer.append(raw_line)
+
+        flush_section()
+
+        if not section_docs or section_docs[-1].metadata.get("document_index") != doc_index:
+            metadata = dict(doc.metadata)
+            metadata["source_type"] = source_type
+            metadata["layout_parser"] = "fallback-whole-document"
+            metadata["section_path"] = current_section_path
+            metadata["document_index"] = doc_index
+            metadata["cleaned_chars"] = len(cleaned_text)
+            section_docs.append(Document(page_content=cleaned_text, metadata=metadata))
+
+    return section_docs
+
+
+def _build_splitter(source_type: str, level: str) -> RecursiveCharacterTextSplitter:
+    if source_type == "md":
+        separators = ["\n# ", "\n## ", "\n### ", "\n#### ", "\n\n", "\n", "。", ". ", " ", ""]
+        parent_size, parent_overlap = 1800, 220
+        child_size, child_overlap = 500, 80
+    elif source_type == "pdf":
+        separators = ["\n\n", "\n", "。", "；", ". ", "; ", " ", ""]
+        parent_size, parent_overlap = 1800, 240
+        child_size, child_overlap = 600, 100
+    elif source_type == "docx":
+        separators = ["\n\n", "\n", "。", ". ", "; ", " ", ""]
+        parent_size, parent_overlap = 1600, 220
+        child_size, child_overlap = 520, 90
+    else:
+        separators = ["\n\n", "\n", "。", ". ", " ", ""]
+        parent_size, parent_overlap = 1400, 180
+        child_size, child_overlap = 420, 70
+
+    chunk_size, chunk_overlap = (parent_size, parent_overlap) if level == "parent" else (child_size, child_overlap)
+    return RecursiveCharacterTextSplitter(
+        separators=separators,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        add_start_index=True,
+    )
+
+
+def _stable_chunk_id(metadata: dict[str, object], content: str, level: str, index: int) -> str:
+    digest_input = "|".join(
+        [
+            str(metadata.get("source", "")),
+            str(metadata.get("section_path", "root")),
+            str(metadata.get("page", "")),
+            level,
+            str(index),
+            content,
+        ]
+    )
+    return hashlib.sha1(digest_input.encode("utf-8")).hexdigest()[:20]
+
+
+def _inject_section_context(content: str, metadata: dict[str, object]) -> tuple[str, str]:
+    section_path = str(metadata.get("section_path", "root")).strip() or "root"
+    if section_path == "root":
+        return content, content
+
+    section_title = section_path.split("/")[-1]
+    source_type = _detect_source_type(metadata)
+    if source_type == "md":
+        prefix = f"Section path: {section_path}\nSection title: {section_title}\n\n"
+    else:
+        prefix = f"[Section Path] {section_path}\n[Section Title] {section_title}\n\n"
+
+    return prefix + content, content
+
+
+def _build_parent_child_chunks(section_docs: list[Document]) -> tuple[list[Document], list[Document]]:
+    parent_chunks: list[Document] = []
+    child_chunks: list[Document] = []
+
+    for section_index, section_doc in enumerate(section_docs):
+        source_type = _detect_source_type(section_doc.metadata)
+        parent_splitter = _build_splitter(source_type, "parent")
+        parent_docs = parent_splitter.split_documents([section_doc])
+
+        for parent_index, parent_doc in enumerate(parent_docs):
+            parent_metadata = dict(parent_doc.metadata)
+            parent_id = _stable_chunk_id(parent_metadata, parent_doc.page_content, "parent", parent_index)
+            injected_parent_content, parent_preview = _inject_section_context(
+                parent_doc.page_content,
+                parent_metadata,
+            )
+            parent_metadata.update(
+                {
+                    "chunk_level": "parent",
+                    "parent_chunk_id": parent_id,
+                    "parent_chunk_index": parent_index,
+                    "section_index": section_index,
+                    "parent_section_path": parent_metadata.get("section_path", "root"),
+                    "content_preview": parent_preview,
+                }
+            )
+            parent_chunks.append(Document(page_content=injected_parent_content, metadata=parent_metadata))
+
+            child_seed = Document(page_content=parent_preview, metadata=parent_metadata)
+            child_splitter = _build_splitter(source_type, "child")
+            child_docs = child_splitter.split_documents([child_seed])
+
+            for child_index, child_doc in enumerate(child_docs):
+                child_metadata = dict(child_doc.metadata)
+                injected_child_content, child_preview = _inject_section_context(
+                    child_doc.page_content,
+                    child_metadata,
+                )
+                child_metadata.update(
+                    {
+                        "chunk_level": "child",
+                        "parent_chunk_id": parent_id,
+                        "child_chunk_index": child_index,
+                        "section_path": child_metadata.get("section_path", "root"),
+                        "parent_section_path": child_metadata.get("parent_section_path", "root"),
+                        "parent_content_preview": parent_preview[:200],
+                        "content_preview": child_preview,
+                        "chunk_id": _stable_chunk_id(child_metadata, injected_child_content, "child", child_index),
+                    }
+                )
+                child_chunks.append(Document(page_content=injected_child_content, metadata=child_metadata))
+
+    return parent_chunks, child_chunks
 
 
 def _build_loader(loader_cls: type, file_path: str):
@@ -135,6 +371,7 @@ def index_file(
     # Always expose the original uploaded filename instead of the temp loader path.
     for doc in docs:
         doc.metadata["source"] = filename
+        doc.metadata["source_type"] = suffix.lstrip(".") or "text"
 
     return _split_and_store(docs, collection_name)
 
@@ -151,7 +388,8 @@ def index_text(
         collection_name or settings.chroma_collection_name,
         len(text),
     )
-    docs = [Document(page_content=text, metadata={"source": source})]
+    source_type = Path(source).suffix.lower().lstrip(".") or "text"
+    docs = [Document(page_content=text, metadata={"source": source, "source_type": source_type})]
     return _split_and_store(docs, collection_name)
 
 
@@ -165,22 +403,23 @@ def _split_and_store(
         len(docs),
         collection_name or settings.chroma_collection_name,
     )
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        add_start_index=True,
+    section_docs = _build_section_documents(docs)
+    logger.info("[indexing.layout] section_docs=%s", len(section_docs))
+    parent_chunks, child_chunks = _build_parent_child_chunks(section_docs)
+    logger.info(
+        "[indexing.split] produced parents=%s children=%s",
+        len(parent_chunks),
+        len(child_chunks),
     )
-    chunks = splitter.split_documents(docs)
-    logger.info("[indexing.split] produced chunks=%s", len(chunks))
-    if not chunks:
+    if not child_chunks:
         logger.warning("[indexing.split] no chunks produced")
         return 0
 
     vs = get_vectorstore(collection_name)
-    logger.info("[indexing.store] add_documents chunks=%s", len(chunks))
-    vs.add_documents(chunks)
-    logger.info("[indexing.store] complete chunks=%s", len(chunks))
-    return len(chunks)
+    logger.info("[indexing.store] add_documents child_chunks=%s", len(child_chunks))
+    vs.add_documents(child_chunks)
+    logger.info("[indexing.store] complete child_chunks=%s", len(child_chunks))
+    return len(child_chunks)
 
 
 def list_collections() -> list[dict[str, int | str]]:
