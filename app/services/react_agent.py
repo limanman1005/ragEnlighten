@@ -291,6 +291,7 @@ def _build_agent_runtime(collection_name: str | None = None):
         scored_docs = vectorstore.similarity_search_with_relevance_scores(
             query=query,
             k=settings.retriever_top_k,
+            filter={"chunk_level": "child"},
         )
         tool_docs: list[Document] = []
         for doc, score in scored_docs:

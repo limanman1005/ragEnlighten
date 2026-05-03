@@ -289,6 +289,8 @@ def _render_chunks(payload: dict[str, Any]) -> None:
     )
     for index, chunk in enumerate(payload.get("chunks", []), start=1):
         title_parts = [f"#{index + int(payload.get('offset', 0))}", chunk.get("source") or "unknown source"]
+        if chunk.get("title"):
+            title_parts.append(str(chunk["title"]))
         if chunk.get("chunk_level"):
             title_parts.append(str(chunk["chunk_level"]))
         with st.expander(" | ".join(title_parts), expanded=False):
@@ -300,14 +302,31 @@ def _render_chunks(payload: dict[str, Any]) -> None:
                 {
                     "source_type": chunk.get("source_type"),
                     "chunk_level": chunk.get("chunk_level"),
+                    "title": chunk.get("title"),
+                    "tags": chunk.get("tags", []),
+                    "document_id": chunk.get("document_id"),
+                    "section_depth": chunk.get("section_depth"),
+                    "chunk_size": chunk.get("chunk_size"),
+                    "chunk_overlap": chunk.get("chunk_overlap"),
+                    "has_children": chunk.get("has_children"),
                     "parent_section_path": chunk.get("parent_section_path"),
                     "parent_chunk_id": chunk.get("parent_chunk_id"),
                     "parent_chunk_index": chunk.get("parent_chunk_index"),
                     "child_chunk_index": chunk.get("child_chunk_index"),
+                    "child_chunk_count": chunk.get("child_chunk_count"),
+                    "child_chunk_start_index": chunk.get("child_chunk_start_index"),
+                    "child_chunk_end_index": chunk.get("child_chunk_end_index"),
                     "start_index": chunk.get("start_index"),
                 }
             )
-            st.code(chunk.get("content", ""), language=None)
+            st.text_area(
+                "Chunk content",
+                value=chunk.get("content", ""),
+                height=220,
+                disabled=True,
+                key=f"chunk-content-{chunk.get('id')}",
+                label_visibility="collapsed",
+            )
 
 
 st.set_page_config(page_title="ragEnlighten UI", page_icon="📚", layout="wide")

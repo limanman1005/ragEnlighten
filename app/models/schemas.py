@@ -166,11 +166,21 @@ class ChunkRecord(BaseModel):
     page: int | None = None
     source_type: str | None = None
     chunk_level: str | None = None
+    title: str | None = None
+    tags: list[str] = Field(default_factory=list)
     section_path: str | None = None
     parent_section_path: str | None = None
     parent_chunk_id: str | None = None
     parent_chunk_index: int | None = None
     child_chunk_index: int | None = None
+    child_chunk_count: int | None = None
+    child_chunk_start_index: int | None = None
+    child_chunk_end_index: int | None = None
+    document_id: str | None = None
+    section_depth: int | None = None
+    chunk_size: int | None = None
+    chunk_overlap: int | None = None
+    has_children: bool | None = None
     start_index: int | None = None
     content: str
 

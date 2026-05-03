@@ -376,7 +376,10 @@ async def query(body: QueryRequest) -> QueryResponse:
     }
 
     try:
-        final_state = await graph.ainvoke(initial_state)
+        final_state = await graph.ainvoke(
+            initial_state,
+            config={"recursion_limit": settings.langgraph_recursion_limit},
+        )
     except Exception as exc:
         logger.exception("[rag.query] graph failed collection=%s", body.collection_name)
         raise HTTPException(
