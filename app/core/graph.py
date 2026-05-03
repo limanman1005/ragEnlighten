@@ -50,6 +50,11 @@ class RAGState(TypedDict):
     collection_name: str | None
     documents: list[Document]
     answer: str
+    trace: list[str]
+
+
+def _append_trace(state: RAGState, message: str) -> list[str]:
+    return [*state.get("trace", []), message]
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +78,7 @@ def _get_llm() -> ChatOpenAI:
 
 def retrieve(state: RAGState) -> RAGState:
     """Retrieve the top-k most relevant chunks from the vector store."""
+    trace = _append_trace(state, "1. Retrieving relevant document chunks from the vector store")
     logger.info(
         "[rag.retrieve] start collection=%s question=%s",
         state.get("collection_name") or settings.chroma_collection_name,
@@ -82,7 +88,8 @@ def retrieve(state: RAGState) -> RAGState:
     retriever = vs.as_retriever(search_kwargs={"k": settings.retriever_top_k})
     docs = retriever.invoke(state["question"])
     logger.info("[rag.retrieve] complete docs=%s", len(docs))
-    return {**state, "documents": docs}
+    trace.append(f"2. Retrieval complete: {len(docs)} candidate chunks found")
+    return {**state, "documents": docs, "trace": trace}
 
 
 def grade_docs(state: RAGState) -> RAGState:
@@ -94,6 +101,7 @@ def grade_docs(state: RAGState) -> RAGState:
     llm = _get_llm()
     question = state["question"]
     relevant: list[Document] = []
+    trace = _append_trace(state, "3. Grading retrieved chunks for relevance")
     logger.info("[rag.grade] start docs=%s", len(state["documents"]))
 
     grade_prompt = ChatPromptTemplate.from_messages(
@@ -134,11 +142,13 @@ def grade_docs(state: RAGState) -> RAGState:
             relevant.append(doc)
 
     logger.info("[rag.grade] complete relevant_docs=%s", len(relevant))
-    return {**state, "documents": relevant}
+    trace.append(f"4. Relevance grading complete: {len(relevant)} chunks kept")
+    return {**state, "documents": relevant, "trace": trace}
 
 
 def generate(state: RAGState) -> RAGState:
     """Generate an answer using the graded documents as context."""
+    trace = _append_trace(state, "5. Generating grounded answer from relevant chunks")
     logger.info("[rag.generate] start docs=%s", len(state["documents"]))
     llm = _get_llm()
     context = "\n\n---\n\n".join(doc.page_content for doc in state["documents"])
@@ -167,11 +177,13 @@ def generate(state: RAGState) -> RAGState:
     chain = prompt | llm | StrOutputParser()
     answer = chain.invoke({"context": context, "question": state["question"]})
     logger.info("[rag.generate] complete answer_chars=%s", len(answer))
-    return {**state, "answer": answer}
+    trace.append("6. Answer generation complete")
+    return {**state, "answer": answer, "trace": trace}
 
 
 def no_answer(state: RAGState) -> RAGState:
     """Return a polite fallback when no relevant documents were found."""
+    trace = _append_trace(state, "5. No relevant chunks remained after grading")
     logger.info("[rag.no_answer] no relevant documents found")
     return {
         **state,
@@ -179,6 +191,7 @@ def no_answer(state: RAGState) -> RAGState:
             "I could not find any relevant information in the knowledge base "
             "to answer your question."
         ),
+        "trace": [*trace, "6. Returned fallback response"],
     }
 
 

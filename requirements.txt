@@ -25,6 +25,7 @@ python-dotenv>=1.0.0
 python-multipart>=0.0.9
 pydantic>=2.7.0
 pydantic-settings>=2.3.0
+streamlit>=1.44.0
 
 # Alibaba DashScope SDK
 dashscope>=1.20.0

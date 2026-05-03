@@ -87,6 +87,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 访问 `http://localhost:8000/docs` 查看交互式 API 文档。
 
+### 4. 启动 Streamlit 前端
+
+```bash
+streamlit run streamlit_app.py
+```
+
+默认会连接 `http://127.0.0.1:8004/api/v1`，也可以在页面侧边栏里改成你当前 FastAPI 服务的地址。
+
 ---
 
 ## API 端点

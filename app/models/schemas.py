@@ -45,6 +45,7 @@ class QueryResponse(BaseModel):
     question: str
     answer: str
     sources: list[SourceDocument] = Field(default_factory=list)
+    trace: list[str] = Field(default_factory=list)
 
 
 class IndexResponse(BaseModel):
