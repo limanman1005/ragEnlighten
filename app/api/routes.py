@@ -11,12 +11,16 @@ from fastapi.responses import StreamingResponse
 from app.core.config import settings
 from app.core.graph import get_rag_graph
 from app.models.schemas import (
+    ChunkRecord,
     CollectionInfo,
     DebugEvent,
+    DeleteBySourceRequest,
+    DeleteBySourceResponse,
     DeleteDocumentRequest,
     DeleteResponse,
     HealthResponse,
     IndexResponse,
+    ListChunksResponse,
     ListCollectionsResponse,
     ReactAgentQueryRequest,
     QueryRequest,
@@ -26,9 +30,11 @@ from app.models.schemas import (
     ValidationReport,
 )
 from app.services.indexing import (
+    delete_chunks_by_source,
     delete_document,
     index_file,
     index_text,
+    list_chunks,
     list_collections,
 )
 from app.services.react_agent import run_react_agent_query, stream_react_agent_query
@@ -225,6 +231,53 @@ async def remove_document(
     return DeleteResponse(message="Document deleted successfully.", doc_id=doc_id)
 
 
+@router.api_route(
+    "/documents/source/delete",
+    response_model=DeleteBySourceResponse,
+    tags=["Documents"],
+    methods=["DELETE"],
+)
+async def remove_documents_by_source(body: DeleteBySourceRequest) -> DeleteBySourceResponse:
+    """Delete all vector chunks that belong to the given source."""
+    collection_name = body.collection_name or settings.chroma_collection_name
+    logger.info(
+        "[documents.delete_by_source] start source=%s collection=%s",
+        body.source,
+        collection_name,
+    )
+    try:
+        deleted_count = delete_chunks_by_source(body.source, body.collection_name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No vector data found for source: {body.source}",
+        ) from exc
+    except RuntimeError as exc:
+        logger.exception("[documents.delete_by_source] delete failed source=%s", body.source)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while deleting vector data.",
+        ) from exc
+
+    logger.info(
+        "[documents.delete_by_source] complete source=%s collection=%s deleted=%s",
+        body.source,
+        collection_name,
+        deleted_count,
+    )
+    return DeleteBySourceResponse(
+        message="Vector data deleted successfully.",
+        source=body.source,
+        collection_name=collection_name,
+        deleted_count=deleted_count,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Collections
 # ---------------------------------------------------------------------------
@@ -240,6 +293,36 @@ async def list_all_collections() -> ListCollectionsResponse:
     cols = list_collections()
     return ListCollectionsResponse(
         collections=[CollectionInfo(name=c["name"], count=c["count"]) for c in cols]
+    )
+
+
+@router.get(
+    "/documents/chunks",
+    response_model=ListChunksResponse,
+    tags=["Documents"],
+)
+async def list_stored_chunks(
+    collection_name: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    source_filter: str | None = None,
+) -> ListChunksResponse:
+    """Browse stored vector chunks for the selected collection."""
+    normalized_limit = max(1, min(limit, 100))
+    normalized_offset = max(0, offset)
+    payload = list_chunks(
+        collection_name=collection_name,
+        limit=normalized_limit,
+        offset=normalized_offset,
+        source_filter=source_filter.strip() or None if source_filter else None,
+    )
+    return ListChunksResponse(
+        collection_name=str(payload["collection_name"]),
+        source_filter=payload.get("source_filter"),
+        total=int(payload["total"]),
+        limit=int(payload["limit"]),
+        offset=int(payload["offset"]),
+        chunks=[ChunkRecord(**chunk) for chunk in payload["chunks"]],
     )
 
 

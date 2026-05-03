@@ -170,6 +170,7 @@ c:/Users/liman/githubProject/ragEnlighten/.venv/Scripts/python.exe -m streamlit 
 | POST | `/api/v1/documents/upload` | 上传文件并建立索引 |
 | POST | `/api/v1/documents/text` | 索引纯文本 |
 | DELETE | `/api/v1/documents/{doc_id}` | 删除指定文档块 |
+| DELETE | `/api/v1/documents/source/delete` | 按 source 删除该文档的全部向量块 |
 | GET  | `/api/v1/collections` | 列出所有知识库集合 |
 | POST | `/api/v1/query` | RAG 问答 |
 

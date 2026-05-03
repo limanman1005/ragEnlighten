@@ -46,6 +46,47 @@ def _upload_file(base_url: str, file_name: str, file_bytes: bytes, collection_na
     return response.json()
 
 
+def _fetch_chunks(
+    base_url: str,
+    collection_name: str | None,
+    limit: int,
+    offset: int,
+    source_filter: str | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if collection_name:
+        params["collection_name"] = collection_name
+    if source_filter:
+        params["source_filter"] = source_filter
+
+    response = requests.get(
+        f"{base_url}/documents/chunks",
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _delete_chunks_by_source(
+    base_url: str,
+    source: str,
+    collection_name: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"source": source}
+    if collection_name:
+        payload["collection_name"] = collection_name
+
+    response = requests.request(
+        "DELETE",
+        f"{base_url}/documents/source/delete",
+        json=payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def _query(base_url: str, question: str, collection_name: str | None) -> dict[str, Any]:
     payload: dict[str, Any] = {"question": question}
     if collection_name:
@@ -171,6 +212,13 @@ def _init_state() -> None:
         st.session_state.chat_sessions = {"langgraph": [], "react_agent": []}
     if "collection_names" not in st.session_state:
         st.session_state.collection_names = []
+    if "chunk_browser" not in st.session_state:
+        st.session_state.chunk_browser = {
+            "offset": 0,
+            "limit": 20,
+            "source_filter": "",
+            "payload": None,
+        }
 
 
 def _render_agentic_details(result: dict[str, Any]) -> None:
@@ -233,6 +281,35 @@ def _render_sources(sources: list[dict[str, Any]]) -> None:
             st.write(source.get("content", ""))
 
 
+def _render_chunks(payload: dict[str, Any]) -> None:
+    st.caption(
+        f"Collection: {payload.get('collection_name', 'unknown')} | "
+        f"Source filter: {payload.get('source_filter') or 'all'} | "
+        f"Showing {len(payload.get('chunks', []))} / {payload.get('total', 0)} chunks"
+    )
+    for index, chunk in enumerate(payload.get("chunks", []), start=1):
+        title_parts = [f"#{index + int(payload.get('offset', 0))}", chunk.get("source") or "unknown source"]
+        if chunk.get("chunk_level"):
+            title_parts.append(str(chunk["chunk_level"]))
+        with st.expander(" | ".join(title_parts), expanded=False):
+            meta_cols = st.columns(3)
+            meta_cols[0].caption(f"Page: {chunk.get('page') or 'n/a'}")
+            meta_cols[1].caption(f"Section: {chunk.get('section_path') or 'root'}")
+            meta_cols[2].caption(f"Chunk ID: {chunk.get('id')}")
+            st.json(
+                {
+                    "source_type": chunk.get("source_type"),
+                    "chunk_level": chunk.get("chunk_level"),
+                    "parent_section_path": chunk.get("parent_section_path"),
+                    "parent_chunk_id": chunk.get("parent_chunk_id"),
+                    "parent_chunk_index": chunk.get("parent_chunk_index"),
+                    "child_chunk_index": chunk.get("child_chunk_index"),
+                    "start_index": chunk.get("start_index"),
+                }
+            )
+            st.code(chunk.get("content", ""), language=None)
+
+
 st.set_page_config(page_title="ragEnlighten UI", page_icon="📚", layout="wide")
 _init_state()
 
@@ -268,7 +345,7 @@ with st.sidebar:
     st.code(active_collection or "rag_documents", language=None)
 
 
-upload_tab, chat_tab = st.tabs(["Upload", "Chat"])
+upload_tab, chat_tab, chunks_tab = st.tabs(["Upload", "Chat", "Chunks"])
 
 
 with upload_tab:
@@ -448,3 +525,115 @@ with chat_tab:
                 details = exc.response.text if exc.response is not None else str(exc)
                 status.update(label="Chat request failed", state="error")
                 st.error(details)
+
+
+with chunks_tab:
+    st.subheader("Browse stored chunks")
+    st.caption("Inspect the chunks currently stored in the selected vector collection.")
+    browser_state = st.session_state.chunk_browser
+    chunk_limit = st.number_input(
+        "Chunks per page",
+        min_value=1,
+        max_value=100,
+        value=int(browser_state.get("limit", 20)),
+        step=5,
+    )
+    source_filter = st.text_input(
+        "Filter by source",
+        value=str(browser_state.get("source_filter", "")),
+        placeholder="e.g. resume.pdf",
+    )
+    controls = st.columns(3)
+    load_requested = controls[0].button("Load chunks", use_container_width=True)
+    previous_requested = controls[1].button("Previous page", use_container_width=True)
+    next_requested = controls[2].button("Next page", use_container_width=True)
+
+    if previous_requested:
+        browser_state["offset"] = max(0, int(browser_state.get("offset", 0)) - int(chunk_limit))
+    elif next_requested:
+        browser_state["offset"] = int(browser_state.get("offset", 0)) + int(chunk_limit)
+
+    filter_changed = (
+        int(browser_state.get("limit", 20)) != int(chunk_limit)
+        or str(browser_state.get("source_filter", "")) != source_filter
+    )
+    if filter_changed:
+        browser_state["offset"] = 0
+
+    browser_state["limit"] = int(chunk_limit)
+    browser_state["source_filter"] = source_filter
+
+    if load_requested or previous_requested or next_requested or filter_changed:
+        try:
+            with st.spinner("Loading chunks from vector store..."):
+                chunk_payload = _fetch_chunks(
+                    backend_url,
+                    active_collection,
+                    int(browser_state["limit"]),
+                    int(browser_state["offset"]),
+                    browser_state["source_filter"].strip() or None,
+                )
+            total = int(chunk_payload.get("total", 0))
+            current_offset = int(browser_state["offset"])
+            if total and current_offset >= total:
+                browser_state["offset"] = max(
+                    0,
+                    ((total - 1) // int(browser_state["limit"])) * int(browser_state["limit"]),
+                )
+                chunk_payload = _fetch_chunks(
+                    backend_url,
+                    active_collection,
+                    int(browser_state["limit"]),
+                    int(browser_state["offset"]),
+                    browser_state["source_filter"].strip() or None,
+                )
+            browser_state["payload"] = chunk_payload
+        except requests.RequestException as exc:
+            details = exc.response.text if exc.response is not None else str(exc)
+            st.error(f"Failed to load chunks: {details}")
+
+    payload = browser_state.get("payload")
+    if payload:
+        nav_cols = st.columns(3)
+        nav_cols[0].caption(f"Offset: {payload.get('offset', 0)}")
+        nav_cols[1].caption(f"Page size: {payload.get('limit', 20)}")
+        nav_cols[2].caption(f"Total: {payload.get('total', 0)}")
+
+        active_source_filter = (browser_state.get("source_filter", "") or "").strip()
+        delete_disabled = not active_source_filter
+        delete_help = (
+            "Enter a source filter before deleting vector data."
+            if delete_disabled
+            else f"Delete all chunks whose source is '{active_source_filter}'."
+        )
+        if st.button(
+            "Delete current source data",
+            type="secondary",
+            use_container_width=True,
+            disabled=delete_disabled,
+            help=delete_help,
+        ):
+            try:
+                with st.spinner("Deleting vector data from the selected collection..."):
+                    delete_result = _delete_chunks_by_source(
+                        backend_url,
+                        active_source_filter,
+                        active_collection,
+                    )
+                st.success(
+                    f"Deleted {delete_result['deleted_count']} chunks for source '{delete_result['source']}'."
+                )
+                browser_state["offset"] = 0
+                browser_state["payload"] = _fetch_chunks(
+                    backend_url,
+                    active_collection,
+                    int(browser_state["limit"]),
+                    0,
+                    active_source_filter,
+                )
+                st.session_state.collection_names = _fetch_collections(backend_url)
+            except requests.RequestException as exc:
+                details = exc.response.text if exc.response is not None else str(exc)
+                st.error(f"Delete failed: {details}")
+
+        _render_chunks(payload)
