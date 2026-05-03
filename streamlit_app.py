@@ -161,6 +161,32 @@ def _build_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return history
 
 
+def _render_history_preview(messages: list[dict[str, Any]]) -> None:
+    history = _build_history(messages)
+    st.caption(f"History messages sent on next turn: {len(history)}")
+    if not history:
+        st.caption("No history will be sent to the model.")
+        return
+
+    with st.expander("Current model history", expanded=False):
+        for index, item in enumerate(history[-6:], start=max(1, len(history) - 5)):
+            role = item.get("role", "unknown")
+            content = str(item.get("content", "")).strip()
+            preview = content if len(content) <= 220 else f"{content[:220]}..."
+            st.markdown(f"**{index}. {role}**")
+            st.write(preview or "(empty)")
+            if item.get("reasoning_content"):
+                st.caption("Includes hidden reasoning_content")
+
+
+def _render_reasoning_content(reasoning_content: str | None) -> None:
+    if not reasoning_content:
+        return
+
+    with st.expander("LLM reasoning", expanded=False):
+        st.text(reasoning_content)
+
+
 def _render_debug_panel(events: list[dict[str, Any]]) -> None:
     with st.expander("Agent debug panel", expanded=False):
         if not events:
@@ -269,6 +295,10 @@ def _render_sources(sources: list[dict[str, Any]]) -> None:
             retrieval_score = source.get("retrieval_score")
             retrieval_hop = source.get("retrieval_hop")
             summary = [title]
+            if source.get("title"):
+                summary.append(str(source["title"]))
+            if source.get("chunk_level"):
+                summary.append(str(source["chunk_level"]))
             if retrieval_hop is not None:
                 summary.append(f"hop {retrieval_hop}")
             if retrieval_score is not None:
@@ -278,7 +308,16 @@ def _render_sources(sources: list[dict[str, Any]]) -> None:
                 st.caption(f"Section path: {source['section_path']}")
             if source.get("parent_chunk_id"):
                 st.caption(f"Parent chunk: {source['parent_chunk_id']}")
-            st.write(source.get("content", ""))
+            with st.container(border=True):
+                st.caption("Matched child evidence")
+                st.write(source.get("content", ""))
+            if source.get("parent_content"):
+                with st.container(border=True):
+                    parent_label = source.get("parent_title") or source.get("parent_section_path") or "parent context"
+                    st.caption(f"Parent context used by agent: {parent_label}")
+                    if source.get("parent_section_path"):
+                        st.caption(f"Parent section: {source['parent_section_path']}")
+                    st.write(source.get("parent_content", ""))
 
 
 def _render_chunks(payload: dict[str, Any]) -> None:
@@ -354,6 +393,9 @@ with st.sidebar:
         except requests.RequestException as exc:
             st.error(f"Failed to load collections: {exc}")
 
+    active_session_key = _session_key(chat_mode)
+    active_chat_session = st.session_state.chat_sessions[active_session_key]
+
     collection_options = ["(default collection)", *st.session_state.collection_names]
     selected_collection = st.selectbox("Existing collection", options=collection_options)
     custom_collection = st.text_input("Or enter a collection name", value="")
@@ -362,6 +404,15 @@ with st.sidebar:
     st.divider()
     st.caption("Current target collection")
     st.code(active_collection or "rag_documents", language=None)
+
+    if chat_mode == "React Agent":
+        st.divider()
+        st.subheader("React Agent Session")
+        st.caption(f"Current messages in session: {len(active_chat_session)}")
+        if st.button("Clear React Agent Session", use_container_width=True):
+            st.session_state.chat_sessions["react_agent"] = []
+            st.rerun()
+        _render_history_preview(active_chat_session)
 
 
 upload_tab, chat_tab, chunks_tab = st.tabs(["Upload", "Chat", "Chunks"])
@@ -406,6 +457,7 @@ with chat_tab:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message["role"] == "assistant":
+                _render_reasoning_content(message.get("reasoning_content"))
                 if message.get("trace"):
                     with st.expander("Execution trace", expanded=True):
                         for item in message["trace"]:
@@ -468,6 +520,7 @@ with chat_tab:
                     )
                     status_state = "error" if final_result.get("needs_human_review") else "complete"
                     status.update(label=status_label, state=status_state)
+                    _render_reasoning_content(final_result.get("reasoning_content"))
                     _render_agentic_details(final_result)
                     if trace:
                         with st.expander("Execution trace", expanded=True):
@@ -511,6 +564,7 @@ with chat_tab:
                     status.update(label=status_label, state=status_state)
 
                     st.markdown(result["answer"])
+                    _render_reasoning_content(result.get("reasoning_content"))
                     _render_agentic_details(result)
                     if trace:
                         with st.expander("Execution trace", expanded=True):

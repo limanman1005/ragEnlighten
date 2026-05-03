@@ -402,14 +402,20 @@ def _get_embeddings():
     return OpenAIEmbeddings(**kwargs)
 
 
+def _get_chroma_persist_dir() -> str:
+    """Return a stable absolute path for the Chroma persistence directory."""
+    return str(Path(settings.chroma_persist_dir).expanduser().resolve())
+
+
 def get_vectorstore(collection_name: str | None = None) -> Chroma:
     """Return (or create) a Chroma vector store for the given collection."""
     name = collection_name or settings.chroma_collection_name
-    logger.info("[indexing.vectorstore] open collection=%s persist_dir=%s", name, settings.chroma_persist_dir)
+    persist_dir = _get_chroma_persist_dir()
+    logger.info("[indexing.vectorstore] open collection=%s persist_dir=%s", name, persist_dir)
     return Chroma(
         collection_name=name,
         embedding_function=_get_embeddings(),
-        persist_directory=settings.chroma_persist_dir,
+        persist_directory=persist_dir,
     )
 
 
@@ -531,7 +537,7 @@ def list_collections() -> list[dict[str, int | str]]:
     """Return all Chroma collections with their document counts."""
     import chromadb
 
-    client = chromadb.PersistentClient(path=settings.chroma_persist_dir)
+    client = chromadb.PersistentClient(path=_get_chroma_persist_dir())
     result = []
     for col in client.list_collections():
         result.append({"name": col.name, "count": col.count()})
@@ -604,6 +610,40 @@ def list_chunks(
         "offset": offset,
         "chunks": chunks,
     }
+
+
+def get_parent_chunks_by_ids(
+    parent_chunk_ids: list[str],
+    collection_name: str | None = None,
+) -> list[Document]:
+    """Return parent chunks keyed by their metadata parent_chunk_id."""
+    normalized_ids = [item.strip() for item in parent_chunk_ids if str(item).strip()]
+    if not normalized_ids:
+        return []
+
+    vs = get_vectorstore(collection_name)
+    resolved_collection = collection_name or settings.chroma_collection_name
+    logger.info(
+        "[indexing.parents] fetch collection=%s parent_ids=%s",
+        resolved_collection,
+        len(normalized_ids),
+    )
+    collection = vs._collection
+    payload = collection.get(
+        where={
+            "$and": [
+                {"chunk_level": "parent"},
+                {"parent_chunk_id": {"$in": normalized_ids}},
+            ]
+        },
+        include=["documents", "metadatas"],
+    )
+    documents = payload.get("documents") or []
+    metadatas = payload.get("metadatas") or []
+    parent_docs: list[Document] = []
+    for document, metadata in zip(documents, metadatas):
+        parent_docs.append(Document(page_content=document or "", metadata=metadata or {}))
+    return parent_docs
 
 
 def delete_document(doc_id: str, collection_name: str | None = None) -> None:

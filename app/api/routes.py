@@ -48,8 +48,13 @@ def _build_source_documents(documents: list) -> list[SourceDocument]:
         SourceDocument(
             source=doc.metadata.get("source", ""),
             page=doc.metadata.get("page"),
+            title=doc.metadata.get("title"),
+            chunk_level=doc.metadata.get("chunk_level"),
             section_path=doc.metadata.get("section_path"),
             parent_chunk_id=doc.metadata.get("parent_chunk_id"),
+            parent_title=doc.metadata.get("parent_title"),
+            parent_section_path=doc.metadata.get("parent_section_path"),
+            parent_content=(doc.metadata.get("parent_content_preview") or "")[: settings.rewrite_context_chars] or None,
             retrieval_score=doc.metadata.get("retrieval_score"),
             retrieval_hop=doc.metadata.get("retrieval_hop"),
             content=(doc.metadata.get("content_preview") or doc.page_content)[: settings.source_preview_chars],

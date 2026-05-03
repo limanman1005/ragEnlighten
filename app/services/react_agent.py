@@ -14,7 +14,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 from app.core.config import settings
-from app.services.indexing import get_vectorstore, list_collections
+from app.services.indexing import get_parent_chunks_by_ids, get_vectorstore, list_collections
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -214,6 +214,208 @@ def _format_documents(docs: list[Document]) -> str:
     return "\n\n".join(parts)
 
 
+def _format_parent_child_documents(
+    child_docs: list[Document],
+    parent_docs: list[Document],
+) -> str:
+    if not child_docs:
+        return "No relevant documents were found in the knowledge base."
+
+    parent_by_id = {
+        str(doc.metadata.get("parent_chunk_id") or ""): doc
+        for doc in parent_docs
+        if doc.metadata.get("parent_chunk_id")
+    }
+    grouped_children: dict[str, list[Document]] = {}
+    for child_doc in child_docs:
+        parent_id = str(child_doc.metadata.get("parent_chunk_id") or "")
+        grouped_children.setdefault(parent_id, []).append(child_doc)
+
+    parts: list[str] = []
+    for group_index, child_doc in enumerate(child_docs, start=1):
+        parent_id = str(child_doc.metadata.get("parent_chunk_id") or "")
+        if group_index > 1 and parent_id in grouped_children:
+            if grouped_children[parent_id][0] is not child_doc:
+                continue
+
+        source = child_doc.metadata.get("source", "unknown")
+        section_path = child_doc.metadata.get("section_path") or "root"
+        retrieval_score = child_doc.metadata.get("retrieval_score")
+        score_text = f"{float(retrieval_score):.4f}" if retrieval_score is not None else "n/a"
+        matched_children = grouped_children.get(parent_id, [child_doc])
+        parent_doc = parent_by_id.get(parent_id)
+
+        header = f"[{group_index}] source={source}; section={section_path}; score={score_text}"
+        if parent_doc is not None:
+            parent_title = parent_doc.metadata.get("title") or parent_doc.metadata.get("section_path") or "root"
+            parent_preview = (
+                parent_doc.metadata.get("content_preview") or parent_doc.page_content
+            )[: settings.rewrite_context_chars]
+            child_parts = []
+            for child_index, matched_child in enumerate(matched_children, start=1):
+                child_preview = (
+                    matched_child.metadata.get("content_preview") or matched_child.page_content
+                )[: settings.source_preview_chars]
+                child_parts.append(f"  Child {child_index}: {child_preview}")
+            parts.append(
+                f"{header}\nParent context [{parent_title}]:\n{parent_preview}\nMatched child evidence:\n"
+                + "\n".join(child_parts)
+            )
+        else:
+            child_preview = (
+                child_doc.metadata.get("content_preview") or child_doc.page_content
+            )[: settings.source_preview_chars]
+            parts.append(f"{header}\n{child_preview}")
+    return "\n\n".join(parts)
+
+
+def _build_retrieval_audit_text(
+    child_docs: list[Document],
+    parent_docs: list[Document],
+) -> str:
+    if not child_docs:
+        return "Retrieval audit: no child chunks matched the query."
+
+    child_lines: list[str] = []
+    for index, child_doc in enumerate(child_docs, start=1):
+        child_lines.append(
+            "- "
+            f"child[{index}] source={child_doc.metadata.get('source', 'unknown')}; "
+            f"title={child_doc.metadata.get('title') or 'n/a'}; "
+            f"section={child_doc.metadata.get('section_path') or 'root'}; "
+            f"parent_chunk_id={child_doc.metadata.get('parent_chunk_id') or 'n/a'}; "
+            f"score={child_doc.metadata.get('retrieval_score', 'n/a')}"
+        )
+
+    parent_lines: list[str] = []
+    for index, parent_doc in enumerate(parent_docs, start=1):
+        preview = (parent_doc.metadata.get('content_preview') or parent_doc.page_content)[:200]
+        parent_lines.append(
+            "- "
+            f"parent[{index}] title={parent_doc.metadata.get('title') or 'n/a'}; "
+            f"section={parent_doc.metadata.get('section_path') or parent_doc.metadata.get('parent_section_path') or 'root'}; "
+            f"parent_chunk_id={parent_doc.metadata.get('parent_chunk_id') or 'n/a'}; "
+            f"preview={preview}"
+        )
+
+    parts = ["Retrieval audit", "Matched child chunks:", *child_lines]
+    if parent_lines:
+        parts.extend(["Recovered parent contexts:", *parent_lines])
+    else:
+        parts.append("Recovered parent contexts: none")
+    return "\n".join(parts)
+
+
+def _build_grounding_context_details(documents: list[Document]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for document in documents:
+        metadata = document.metadata
+        parent_chunk_id = str(metadata.get("parent_chunk_id") or f"no-parent-{len(grouped) + 1}")
+        entry = grouped.setdefault(
+            parent_chunk_id,
+            {
+                "source": metadata.get("source", "unknown"),
+                "parent_chunk_id": metadata.get("parent_chunk_id"),
+                "parent_title": metadata.get("parent_title"),
+                "parent_section_path": metadata.get("parent_section_path"),
+                "parent_content_preview": metadata.get("parent_content_preview"),
+                "children": [],
+            },
+        )
+        entry["children"].append(
+            {
+                "title": metadata.get("title"),
+                "section_path": metadata.get("section_path"),
+                "retrieval_score": metadata.get("retrieval_score"),
+                "content_preview": (metadata.get("content_preview") or document.page_content)[: settings.source_preview_chars],
+            }
+        )
+    return list(grouped.values())
+
+
+def _build_grounding_context_text(documents: list[Document]) -> str:
+    details = _build_grounding_context_details(documents)
+    if not details:
+        return "Final grounding context: no retrieved chunks were available for answer synthesis."
+
+    parts = ["Final grounding context used for answer synthesis"]
+    for index, entry in enumerate(details, start=1):
+        parts.append(
+            f"Group {index}: source={entry['source']}; parent_chunk_id={entry.get('parent_chunk_id') or 'n/a'}; "
+            f"parent_title={entry.get('parent_title') or 'n/a'}; parent_section={entry.get('parent_section_path') or 'n/a'}"
+        )
+        if entry.get("parent_content_preview"):
+            parts.append(f"  Parent preview: {entry['parent_content_preview']}")
+        for child_index, child in enumerate(entry.get("children", []), start=1):
+            parts.append(
+                f"  Child {child_index}: title={child.get('title') or 'n/a'}; "
+                f"section={child.get('section_path') or 'root'}; "
+                f"score={child.get('retrieval_score', 'n/a')}; "
+                f"preview={child.get('content_preview') or ''}"
+            )
+    return "\n".join(parts)
+
+
+def _build_grounding_status(documents: list[Document], tool_calls: list[dict[str, str]]) -> dict[str, Any]:
+    knowledge_search_calls = [call for call in tool_calls if call.get("name") == "knowledge_base_search"]
+    metadata_calls = [call for call in tool_calls if call.get("name") == "collection_overview"]
+
+    if documents:
+        return {
+            "status": "grounded",
+            "message": (
+                f"Grounded answer with {len(documents)} retrieved child chunks after "
+                f"{len(knowledge_search_calls)} knowledge-base search call(s)."
+            ),
+            "knowledge_search_calls": len(knowledge_search_calls),
+            "metadata_calls": len(metadata_calls),
+            "documents": len(documents),
+        }
+
+    if not knowledge_search_calls:
+        return {
+            "status": "no_tool_call",
+            "message": (
+                "No retrieved chunks were available because the agent finished without calling "
+                "knowledge_base_search. Any answer produced in this state is not grounded in the vector store."
+            ),
+            "knowledge_search_calls": 0,
+            "metadata_calls": len(metadata_calls),
+            "documents": 0,
+        }
+
+    return {
+        "status": "empty_retrieval",
+        "message": (
+            f"knowledge_base_search was called {len(knowledge_search_calls)} time(s), but no child chunks were retained "
+            "for final answer synthesis."
+        ),
+        "knowledge_search_calls": len(knowledge_search_calls),
+        "metadata_calls": len(metadata_calls),
+        "documents": 0,
+    }
+
+
+def _apply_grounding_guard(answer: str, grounding_status: dict[str, Any]) -> tuple[str, bool, str | None]:
+    if grounding_status.get("status") == "grounded":
+        return answer, False, None
+
+    if grounding_status.get("status") == "no_tool_call":
+        return (
+            "I could not verify this answer against the knowledge base because the agent did not use the retrieval tool. "
+            "Please retry or inspect the tool trace before trusting a generated answer.",
+            True,
+            grounding_status.get("message"),
+        )
+
+    return (
+        "I could not find grounded evidence in the knowledge base for this question, so I am not returning a factual answer. "
+        "Please refine the query or inspect the retrieved chunks.",
+        True,
+        grounding_status.get("message"),
+    )
+
+
 def _build_messages(question: str, history: list[dict[str, Any]] | None) -> list[BaseMessage]:
     messages: list[BaseMessage] = []
     assistant_messages = 0
@@ -294,19 +496,51 @@ def _build_agent_runtime(collection_name: str | None = None):
             filter={"chunk_level": "child"},
         )
         tool_docs: list[Document] = []
+        parent_chunk_ids: list[str] = []
         for doc, score in scored_docs:
             metadata = dict(doc.metadata)
             metadata["retrieval_score"] = round(float(score), 4)
             metadata["retrieval_hop"] = 1
             tool_docs.append(Document(page_content=doc.page_content, metadata=metadata))
+            parent_chunk_id = str(metadata.get("parent_chunk_id") or "").strip()
+            if parent_chunk_id:
+                parent_chunk_ids.append(parent_chunk_id)
 
-        documents = _merge_documents(documents, tool_docs)
+        parent_docs = get_parent_chunks_by_ids(parent_chunk_ids, collection_name)
+        parent_by_id = {
+            str(doc.metadata.get("parent_chunk_id") or ""): doc
+            for doc in parent_docs
+            if doc.metadata.get("parent_chunk_id")
+        }
+        grouped_children: dict[str, list[Document]] = {}
+        for tool_doc in tool_docs:
+            parent_chunk_id = str(tool_doc.metadata.get("parent_chunk_id") or "")
+            grouped_children.setdefault(parent_chunk_id, []).append(tool_doc)
+
+        enriched_tool_docs: list[Document] = []
+        for tool_doc in tool_docs:
+            metadata = dict(tool_doc.metadata)
+            parent_chunk_id = str(metadata.get("parent_chunk_id") or "")
+            parent_doc = parent_by_id.get(parent_chunk_id)
+            if parent_doc is not None:
+                metadata["parent_title"] = parent_doc.metadata.get("title") or parent_doc.metadata.get("section_path")
+                metadata["parent_section_path"] = parent_doc.metadata.get("section_path") or parent_doc.metadata.get("parent_section_path")
+                metadata["parent_content_preview"] = (
+                    parent_doc.metadata.get("content_preview") or parent_doc.page_content
+                )[: settings.rewrite_context_chars]
+                metadata["matched_child_count"] = len(grouped_children.get(parent_chunk_id, []))
+            enriched_tool_docs.append(Document(page_content=tool_doc.page_content, metadata=metadata))
+
+        retrieval_audit = _build_retrieval_audit_text(enriched_tool_docs, parent_docs)
+        documents = _merge_documents(documents, enriched_tool_docs)
         logger.info(
-            "[react_agent.tool.search] complete results=%s merged_documents=%s",
-            len(tool_docs),
+            "[react_agent.tool.search] complete results=%s parent_results=%s merged_documents=%s\n%s",
+            len(enriched_tool_docs),
+            len(parent_docs),
             len(documents),
+            retrieval_audit,
         )
-        return _format_documents(tool_docs)
+        return retrieval_audit + "\n\n" + _format_parent_child_documents(enriched_tool_docs, parent_docs)
 
     @tool
     def collection_overview() -> str:
@@ -347,6 +581,8 @@ def _build_react_agent_result(
     answer: str,
     reasoning_content: str | None = None,
     debug_events: list[dict[str, Any]] | None = None,
+    needs_human_review: bool = False,
+    human_review_reason: str | None = None,
 ) -> dict[str, Any]:
     confidence_score = min(0.95, 0.35 + (0.15 * len(documents))) if documents else 0.2
     validation_issues = [] if documents else ["No grounded source chunks were returned by the agent tools."]
@@ -374,8 +610,8 @@ def _build_react_agent_result(
         "trace": trace,
         "debug_events": debug_events or [],
         "confidence_score": round(confidence_score, 4),
-        "needs_human_review": False,
-        "human_review_reason": None,
+        "needs_human_review": needs_human_review,
+        "human_review_reason": human_review_reason,
         "validation": {
             "passed": bool(answer.strip()) and bool(documents),
             "confidence": round(confidence_score, 4),
@@ -484,7 +720,7 @@ async def run_react_agent_query(
                 },
             )
             entry["status"] = "success"
-            entry["output_summary"] = _stringify_content(message.content)[:400]
+            entry["output_summary"] = _stringify_content(message.content)[:1600]
             tool_calls.append(entry)
             observe_round = int(entry.get("round_number", "0") or 0) or None
             _append_debug_event(
@@ -520,6 +756,40 @@ async def run_react_agent_query(
     if not answer:
         answer = "I could not produce a grounded answer from the available tool results."
     reasoning_content = _extract_reasoning_content(messages)
+    grounding_status = _build_grounding_status(documents, tool_calls)
+    raw_answer = answer
+    answer, needs_human_review, human_review_reason = _apply_grounding_guard(answer, grounding_status)
+    grounding_context_text = _build_grounding_context_text(documents)
+    grounding_context_details = _build_grounding_context_details(documents)
+    logger.info("[react_agent.grounding.status] %s", grounding_status["message"])
+    logger.info("[react_agent.grounding] documents=%s\n%s", len(documents), grounding_context_text)
+    _append_debug_event(
+        debug_events,
+        "grounding_status",
+        grounding_status["message"],
+        status=grounding_status["status"],
+        knowledge_search_calls=grounding_status["knowledge_search_calls"],
+        metadata_calls=grounding_status["metadata_calls"],
+        documents=grounding_status["documents"],
+    )
+    if answer != raw_answer:
+        _append_debug_event(
+            debug_events,
+            "grounding_guard",
+            "Replaced ungrounded model answer with a guarded fallback response",
+            original_answer_chars=len(raw_answer),
+            guarded_answer_chars=len(answer),
+            reason=human_review_reason,
+        )
+    _append_debug_event(
+        debug_events,
+        "grounding_context",
+        "Prepared final grounding context passed into answer synthesis",
+        documents=len(documents),
+        grounding_groups=len(grounding_context_details),
+        grounding_preview=grounding_context_text[:2000],
+        grounded_sources=grounding_context_details,
+    )
     _append_debug_event(
         debug_events,
         "final",
@@ -545,6 +815,8 @@ async def run_react_agent_query(
         answer,
         reasoning_content=reasoning_content,
         debug_events=debug_events,
+        needs_human_review=needs_human_review,
+        human_review_reason=human_review_reason,
     )
 
 
@@ -589,6 +861,8 @@ async def stream_react_agent_query(
     tool_calls: list[dict[str, str]] = []
     final_messages: list[BaseMessage] = []
     answer_tokens: list[str] = []
+    emitted_answer_tokens = 0
+    suppressed_answer_tokens = 0
     input_messages = _build_messages(question, history)
     round_number = 0
 
@@ -611,7 +885,11 @@ async def stream_react_agent_query(
             token = _extract_chunk_text(data.get("chunk"))
             if token:
                 answer_tokens.append(token)
-                yield {"type": "token", "data": token}
+                if documents:
+                    emitted_answer_tokens += 1
+                    yield {"type": "token", "data": token}
+                else:
+                    suppressed_answer_tokens += 1
             continue
 
         if event_name == "on_tool_start":
@@ -656,7 +934,7 @@ async def stream_react_agent_query(
 
         if event_name == "on_tool_end":
             tool_name = str(event.get("name") or "unknown_tool")
-            output_summary = _stringify_content(data.get("output"))[:400]
+            output_summary = _stringify_content(data.get("output"))[:1600]
             matching_id = None
             for call_id, entry in pending_calls.items():
                 if entry["name"] == tool_name:
@@ -725,6 +1003,50 @@ async def stream_react_agent_query(
     if not answer:
         answer = "I could not produce a grounded answer from the available tool results."
     reasoning_content = _extract_reasoning_content(final_messages)
+    grounding_status = _build_grounding_status(documents, tool_calls)
+    raw_answer = answer
+    answer, needs_human_review, human_review_reason = _apply_grounding_guard(answer, grounding_status)
+    grounding_context_text = _build_grounding_context_text(documents)
+    grounding_context_details = _build_grounding_context_details(documents)
+    logger.info("[react_agent.grounding.status] %s", grounding_status["message"])
+    logger.info("[react_agent.grounding] documents=%s\n%s", len(documents), grounding_context_text)
+    if suppressed_answer_tokens:
+        logger.info(
+            "[react_agent.stream] suppressed_answer_tokens=%s emitted_answer_tokens=%s documents=%s",
+            suppressed_answer_tokens,
+            emitted_answer_tokens,
+            len(documents),
+        )
+    _append_debug_event(
+        debug_events,
+        "grounding_status",
+        grounding_status["message"],
+        status=grounding_status["status"],
+        knowledge_search_calls=grounding_status["knowledge_search_calls"],
+        metadata_calls=grounding_status["metadata_calls"],
+        documents=grounding_status["documents"],
+    )
+    yield {"type": "debug", "data": debug_events[-1]}
+    if answer != raw_answer:
+        _append_debug_event(
+            debug_events,
+            "grounding_guard",
+            "Replaced ungrounded model answer with a guarded fallback response",
+            original_answer_chars=len(raw_answer),
+            guarded_answer_chars=len(answer),
+            reason=human_review_reason,
+        )
+        yield {"type": "debug", "data": debug_events[-1]}
+    _append_debug_event(
+        debug_events,
+        "grounding_context",
+        "Prepared final grounding context passed into answer synthesis",
+        documents=len(documents),
+        grounding_groups=len(grounding_context_details),
+        grounding_preview=grounding_context_text[:2000],
+        grounded_sources=grounding_context_details,
+    )
+    yield {"type": "debug", "data": debug_events[-1]}
     _append_debug_event(
         debug_events,
         "final",
@@ -733,6 +1055,8 @@ async def stream_react_agent_query(
         reasoning_present=bool(reasoning_content),
         documents=len(documents),
         streamed_tokens=len(answer_tokens),
+        emitted_tokens=emitted_answer_tokens,
+        suppressed_tokens=suppressed_answer_tokens,
     )
     yield {"type": "debug", "data": debug_events[-1]}
     _log_react_stage("final", None, f"answer_chars={len(answer)} documents={len(documents)}")
@@ -740,10 +1064,12 @@ async def stream_react_agent_query(
     trace_item = f"{len(trace) + 1}. React Agent generated the final answer"
     trace.append(trace_item)
     logger.info(
-        "[react_agent.stream] complete tool_calls=%s documents=%s tokens=%s reasoning=%s",
+        "[react_agent.stream] complete tool_calls=%s documents=%s tokens=%s emitted_tokens=%s suppressed_tokens=%s reasoning=%s",
         len(tool_calls),
         len(documents),
         len(answer_tokens),
+        emitted_answer_tokens,
+        suppressed_answer_tokens,
         bool(reasoning_content),
     )
     yield {"type": "trace", "data": trace_item}
@@ -757,5 +1083,7 @@ async def stream_react_agent_query(
             answer,
             reasoning_content=reasoning_content,
             debug_events=debug_events,
+            needs_human_review=needs_human_review,
+            human_review_reason=human_review_reason,
         ),
     }
