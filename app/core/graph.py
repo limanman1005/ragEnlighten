@@ -22,10 +22,10 @@ Graph topology
 
 from __future__ import annotations
 
-from typing import Annotated, TypedDict
+import logging
+from typing import TypedDict
 
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -33,6 +33,9 @@ from langgraph.graph import END, START, StateGraph
 
 from app.core.config import settings
 from app.services.indexing import get_vectorstore
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 # ---------------------------------------------------------------------------
@@ -70,9 +73,15 @@ def _get_llm() -> ChatOpenAI:
 
 def retrieve(state: RAGState) -> RAGState:
     """Retrieve the top-k most relevant chunks from the vector store."""
+    logger.info(
+        "[rag.retrieve] start collection=%s question=%s",
+        state.get("collection_name") or settings.chroma_collection_name,
+        state["question"][:120],
+    )
     vs = get_vectorstore(state.get("collection_name"))
     retriever = vs.as_retriever(search_kwargs={"k": settings.retriever_top_k})
     docs = retriever.invoke(state["question"])
+    logger.info("[rag.retrieve] complete docs=%s", len(docs))
     return {**state, "documents": docs}
 
 
@@ -85,23 +94,26 @@ def grade_docs(state: RAGState) -> RAGState:
     llm = _get_llm()
     question = state["question"]
     relevant: list[Document] = []
+    logger.info("[rag.grade] start docs=%s", len(state["documents"]))
 
     grade_prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessage(
-                content=(
+            (
+                "system",
+                (
                     "You are a relevance grader. "
                     "Given a user question and a document excerpt, "
                     "reply with a single word: 'yes' if the document is relevant "
                     "to answering the question, or 'no' if it is not."
-                )
+                ),
             ),
-            HumanMessage(
-                content=(
+            (
+                "human",
+                (
                     "Question: {question}\n\n"
                     "Document excerpt:\n{content}\n\n"
                     "Is this document relevant? (yes/no)"
-                )
+                ),
             ),
         ]
     )
@@ -113,43 +125,54 @@ def grade_docs(state: RAGState) -> RAGState:
         )
         response = llm.invoke(messages)
         verdict = response.content.strip().lower()
+        logger.info(
+            "[rag.grade] verdict=%s source=%s",
+            verdict,
+            doc.metadata.get("source", "unknown"),
+        )
         if verdict.startswith("yes"):
             relevant.append(doc)
 
+    logger.info("[rag.grade] complete relevant_docs=%s", len(relevant))
     return {**state, "documents": relevant}
 
 
 def generate(state: RAGState) -> RAGState:
     """Generate an answer using the graded documents as context."""
+    logger.info("[rag.generate] start docs=%s", len(state["documents"]))
     llm = _get_llm()
     context = "\n\n---\n\n".join(doc.page_content for doc in state["documents"])
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            SystemMessage(
-                content=(
+            (
+                "system",
+                (
                     "You are a helpful assistant. "
                     "Answer the user's question based solely on the provided context. "
                     "If the context does not contain enough information, say so honestly."
-                )
+                ),
             ),
-            HumanMessage(
-                content=(
+            (
+                "human",
+                (
                     "Context:\n{context}\n\n"
                     "Question: {question}\n\n"
                     "Answer:"
-                )
+                ),
             ),
         ]
     )
 
     chain = prompt | llm | StrOutputParser()
     answer = chain.invoke({"context": context, "question": state["question"]})
+    logger.info("[rag.generate] complete answer_chars=%s", len(answer))
     return {**state, "answer": answer}
 
 
 def no_answer(state: RAGState) -> RAGState:
     """Return a polite fallback when no relevant documents were found."""
+    logger.info("[rag.no_answer] no relevant documents found")
     return {
         **state,
         "answer": (
@@ -176,6 +199,7 @@ def _route_after_grading(state: RAGState) -> str:
 
 def build_rag_graph() -> StateGraph:
     """Compile and return the RAG StateGraph."""
+    logger.info("[rag.graph] building graph")
     graph = StateGraph(RAGState)
 
     graph.add_node("retrieve", retrieve)
@@ -196,7 +220,9 @@ def build_rag_graph() -> StateGraph:
     graph.add_edge("generate", END)
     graph.add_edge("no_answer", END)
 
-    return graph.compile()
+    compiled = graph.compile()
+    logger.info("[rag.graph] build complete")
+    return compiled
 
 
 # Thread-safe lazy singleton for the compiled graph
@@ -211,5 +237,6 @@ def get_rag_graph():
     if _graph is None:
         with _graph_lock:
             if _graph is None:
+                logger.info("[rag.graph] initializing singleton graph")
                 _graph = build_rag_graph()
     return _graph
