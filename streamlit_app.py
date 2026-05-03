@@ -6,7 +6,7 @@ import requests
 import streamlit as st
 
 
-DEFAULT_BACKEND_URL = "http://127.0.0.1:8004/api/v1"
+DEFAULT_BACKEND_URL = "http://127.0.0.1:8000/api/v1"
 REQUEST_TIMEOUT_SECONDS = 120
 
 
@@ -64,6 +64,62 @@ def _init_state() -> None:
         st.session_state.chat_messages = []
     if "collection_names" not in st.session_state:
         st.session_state.collection_names = []
+
+
+def _render_agentic_details(result: dict[str, Any]) -> None:
+    metadata_cols = st.columns(4)
+    metadata_cols[0].metric("Question type", result.get("question_type", "unknown"))
+    metadata_cols[1].metric("Route", result.get("route", "unknown"))
+    confidence = result.get("confidence_score")
+    metadata_cols[2].metric(
+        "Confidence",
+        f"{float(confidence):.2f}" if confidence is not None else "n/a",
+    )
+    metadata_cols[3].metric(
+        "Human review",
+        "required" if result.get("needs_human_review") else "not needed",
+    )
+
+    if result.get("needs_human_review"):
+        st.warning(result.get("human_review_reason") or "Human review required for this answer.")
+
+    if result.get("plan"):
+        with st.expander("Execution plan", expanded=False):
+            for index, step in enumerate(result["plan"], start=1):
+                st.write(f"{index}. {step}")
+
+    if result.get("tool_calls"):
+        with st.expander("Tool calls", expanded=False):
+            for call in result["tool_calls"]:
+                st.markdown(f"**{call.get('name', 'unknown tool')}** [{call.get('status', 'unknown')}]")
+                if call.get("input_summary"):
+                    st.caption(f"Input: {call['input_summary']}")
+                if call.get("output_summary"):
+                    st.write(call["output_summary"])
+
+    validation = result.get("validation") or {}
+    if validation:
+        with st.expander("Validation report", expanded=False):
+            st.write(f"Passed: {validation.get('passed', False)}")
+            st.write(f"Citations verified: {validation.get('citations_verified', False)}")
+            if validation.get("issues"):
+                for issue in validation["issues"]:
+                    st.write(f"- {issue}")
+
+
+def _render_sources(sources: list[dict[str, Any]]) -> None:
+    with st.expander("Retrieved sources", expanded=False):
+        for source in sources:
+            title = source.get("source", "unknown source")
+            retrieval_score = source.get("retrieval_score")
+            retrieval_hop = source.get("retrieval_hop")
+            summary = [title]
+            if retrieval_hop is not None:
+                summary.append(f"hop {retrieval_hop}")
+            if retrieval_score is not None:
+                summary.append(f"score {float(retrieval_score):.4f}")
+            st.markdown(f"**{' | '.join(summary)}**")
+            st.write(source.get("content", ""))
 
 
 st.set_page_config(page_title="ragEnlighten UI", page_icon="📚", layout="wide")
@@ -135,11 +191,10 @@ with chat_tab:
                     with st.expander("Execution trace", expanded=True):
                         for item in message["trace"]:
                             st.write(item)
+                if message.get("agentic_details"):
+                    _render_agentic_details(message["agentic_details"])
                 if message.get("sources"):
-                    with st.expander("Retrieved sources", expanded=False):
-                        for source in message["sources"]:
-                            st.markdown(f"**{source.get('source', 'unknown source')}**")
-                            st.write(source.get("content", ""))
+                    _render_sources(message["sources"])
 
     question = st.chat_input("Ask a question about the indexed documents")
     if question:
@@ -155,24 +210,34 @@ with chat_tab:
                 trace = result.get("trace", [])
                 for item in trace:
                     status.write(item)
-                status.update(label="RAG pipeline complete", state="complete")
+                status_label = "Human review required" if result.get("needs_human_review") else "RAG pipeline complete"
+                status_state = "error" if result.get("needs_human_review") else "complete"
+                status.update(label=status_label, state=status_state)
 
                 st.markdown(result["answer"])
+                _render_agentic_details(result)
                 if trace:
                     with st.expander("Execution trace", expanded=True):
                         for item in trace:
                             st.write(item)
                 if result.get("sources"):
-                    with st.expander("Retrieved sources", expanded=False):
-                        for source in result["sources"]:
-                            st.markdown(f"**{source.get('source', 'unknown source')}**")
-                            st.write(source.get("content", ""))
+                    _render_sources(result["sources"])
 
                 st.session_state.chat_messages.append(
                     {
                         "role": "assistant",
                         "content": result["answer"],
                         "trace": trace,
+                        "agentic_details": {
+                            "question_type": result.get("question_type"),
+                            "route": result.get("route"),
+                            "plan": result.get("plan", []),
+                            "tool_calls": result.get("tool_calls", []),
+                            "confidence_score": result.get("confidence_score"),
+                            "needs_human_review": result.get("needs_human_review", False),
+                            "human_review_reason": result.get("human_review_reason"),
+                            "validation": result.get("validation"),
+                        },
                         "sources": result.get("sources", []),
                     }
                 )

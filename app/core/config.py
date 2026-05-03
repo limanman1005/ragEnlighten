@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     retriever_top_k: int = 4
     retrieval_max_hops: int = 2
     min_relevant_chunks_to_answer: int = 2
+    max_validation_retries: int = 1
+    answer_validation_min_confidence: float = 0.65
 
     # Content preview lengths
     grade_context_chars: int = 500   # chars of each chunk sent to the relevance grader
