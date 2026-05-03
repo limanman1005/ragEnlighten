@@ -1,0 +1,27 @@
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# LangChain core
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-openai>=0.2.0
+langchain-text-splitters>=0.3.0
+
+# LangGraph
+langgraph>=0.2.0
+
+# Vector store
+chromadb>=0.5.0
+
+# Document loaders
+pypdf>=4.0.0
+python-docx>=1.1.0
+unstructured>=0.15.0
+
+# Utilities
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
