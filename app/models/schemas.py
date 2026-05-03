@@ -49,6 +49,16 @@ class DeleteDocumentRequest(BaseModel):
     )
 
 
+class DeleteBySourceRequest(BaseModel):
+    """Request body for deleting all chunks belonging to one source."""
+
+    source: str = Field(..., min_length=1, description="Source value stored in chunk metadata")
+    collection_name: str | None = Field(
+        default=None,
+        description="Optional collection name; defaults to the global collection",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Response schemas
 # ---------------------------------------------------------------------------
@@ -132,11 +142,48 @@ class DeleteResponse(BaseModel):
     doc_id: str
 
 
+class DeleteBySourceResponse(BaseModel):
+    """Response body for deleting all chunks of a single source."""
+
+    message: str
+    source: str
+    collection_name: str
+    deleted_count: int
+
+
 class CollectionInfo(BaseModel):
     """Information about a single collection."""
 
     name: str
     count: int = Field(description="Number of document chunks in the collection")
+
+
+class ChunkRecord(BaseModel):
+    """A single stored vector chunk with selected metadata."""
+
+    id: str
+    source: str = ""
+    page: int | None = None
+    source_type: str | None = None
+    chunk_level: str | None = None
+    section_path: str | None = None
+    parent_section_path: str | None = None
+    parent_chunk_id: str | None = None
+    parent_chunk_index: int | None = None
+    child_chunk_index: int | None = None
+    start_index: int | None = None
+    content: str
+
+
+class ListChunksResponse(BaseModel):
+    """Response body for browsing stored chunks in a collection."""
+
+    collection_name: str
+    source_filter: str | None = None
+    total: int
+    limit: int
+    offset: int
+    chunks: list[ChunkRecord] = Field(default_factory=list)
 
 
 class ListCollectionsResponse(BaseModel):

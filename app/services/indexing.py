@@ -433,6 +433,64 @@ def list_collections() -> list[dict[str, int | str]]:
     return result
 
 
+def list_chunks(
+    collection_name: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    source_filter: str | None = None,
+) -> dict[str, object]:
+    """Return paginated stored chunks from a Chroma collection."""
+    vs = get_vectorstore(collection_name)
+    resolved_collection = collection_name or settings.chroma_collection_name
+    where_filter = {"source": source_filter} if source_filter else None
+    logger.info(
+        "[indexing.chunks] list collection=%s limit=%s offset=%s source=%s",
+        resolved_collection,
+        limit,
+        offset,
+        source_filter or "*",
+    )
+    collection = vs._collection
+    total_payload = collection.get(where=where_filter, include=[])
+    total = len(total_payload.get("ids") or [])
+    payload = collection.get(
+        where=where_filter,
+        limit=limit,
+        offset=offset,
+        include=["documents", "metadatas"],
+    )
+    ids = payload.get("ids") or []
+    documents = payload.get("documents") or []
+    metadatas = payload.get("metadatas") or []
+    chunks: list[dict[str, object]] = []
+    for chunk_id, document, metadata in zip(ids, documents, metadatas):
+        metadata = metadata or {}
+        chunks.append(
+            {
+                "id": chunk_id,
+                "source": metadata.get("source", ""),
+                "page": metadata.get("page"),
+                "source_type": metadata.get("source_type"),
+                "chunk_level": metadata.get("chunk_level"),
+                "section_path": metadata.get("section_path"),
+                "parent_section_path": metadata.get("parent_section_path"),
+                "parent_chunk_id": metadata.get("parent_chunk_id"),
+                "parent_chunk_index": metadata.get("parent_chunk_index"),
+                "child_chunk_index": metadata.get("child_chunk_index"),
+                "start_index": metadata.get("start_index"),
+                "content": document or "",
+            }
+        )
+    return {
+        "collection_name": resolved_collection,
+        "source_filter": source_filter,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "chunks": chunks,
+    }
+
+
 def delete_document(doc_id: str, collection_name: str | None = None) -> None:
     """Delete a document by its Chroma *doc_id*."""
     vs = get_vectorstore(collection_name)
@@ -442,3 +500,26 @@ def delete_document(doc_id: str, collection_name: str | None = None) -> None:
         collection_name or settings.chroma_collection_name,
     )
     vs.delete([doc_id])
+
+
+def delete_chunks_by_source(source: str, collection_name: str | None = None) -> int:
+    """Delete all chunks whose metadata source matches the provided value."""
+    normalized_source = source.strip()
+    if not normalized_source:
+        raise ValueError("Source is required.")
+
+    vs = get_vectorstore(collection_name)
+    resolved_collection = collection_name or settings.chroma_collection_name
+    collection = vs._collection
+    logger.info(
+        "[indexing.delete] delete source=%s collection=%s",
+        normalized_source,
+        resolved_collection,
+    )
+    payload = collection.get(where={"source": normalized_source}, include=[])
+    ids = payload.get("ids") or []
+    if not ids:
+        raise KeyError(normalized_source)
+
+    collection.delete(where={"source": normalized_source})
+    return len(ids)
