@@ -13,6 +13,8 @@
 | 文档上传与索引 | 支持 PDF、DOCX、TXT、Markdown 文件，自动切分并向量化存储（Chroma） |
 | 文本直接索引 | 可将纯文本片段直接写入知识库 |
 | Agentic RAG 问答 | 基于 LangGraph 的多步流水线：问题分类 → 规划 → 路由 → 查询改写 → 检索 → 相关性评分 → 多跳补充检索 → 生成 → 校验 |
+| React Agent 聊天接口 | 新增 `/api/v1/chat/react-agent`，基于 ReAct 模式按需调用知识库检索工具完成问答，支持传入多轮历史消息 |
+| React Agent 流式接口 | 新增 `/api/v1/chat/react-agent/stream`，以 NDJSON 持续返回 token、trace 和最终结果，适合前端逐步渲染 |
 | 多集合管理 | 支持按集合（collection）组织不同领域的知识库 |
 | 校验与人审 | 低置信度答案会重试一次；高风险问题或无证据场景会标记人工复核 |
 | OpenAPI 文档 | FastAPI 自动生成交互式 Swagger UI（`/docs`）和 ReDoc（`/redoc`） |
@@ -69,6 +71,55 @@ START
   ├─ 高风险或需人工确认 ──▶ [human_review]
   └─ 通过校验 ──▶ [finalize] ──▶ END
 ```
+
+---
+
+## React Agent 聊天接口
+
+新增接口：`POST /api/v1/chat/react-agent`
+
+流式接口：`POST /api/v1/chat/react-agent/stream`
+
+适用场景：
+
+- 希望使用 ReAct Agent 模式，由模型自主决定何时调用知识库检索工具
+- 需要传入历史消息，支持多轮问答上下文
+- 不想替换现有 LangGraph `/query` 流程，而是并行保留两种问答模式
+
+请求示例：
+
+```json
+{
+  "question": "总结一下这个候选人的项目经历",
+  "collection_name": "resume_bank",
+  "history": [
+    {
+      "role": "user",
+      "content": "先告诉我他的主要技术方向"
+    },
+    {
+      "role": "assistant",
+      "content": "他主要集中在后端服务和 RAG 应用开发。"
+    }
+  ]
+}
+```
+
+返回结构与 `/api/v1/query` 基本一致，仍然包含：
+
+- `answer`
+- `tool_calls`
+- `sources`
+- `trace`
+- `confidence_score`
+- `validation`
+
+流式接口返回 `application/x-ndjson`，每一行都是一个 JSON 事件，常见事件类型：
+
+- `trace`：执行轨迹更新
+- `token`：增量文本片段
+- `final`：最终完整响应对象
+- `error`：流执行错误
 
 ---
 

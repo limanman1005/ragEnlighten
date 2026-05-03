@@ -16,7 +16,10 @@ app = FastAPI(
         "**Workflow**\n"
         "1. Upload documents via `/documents/upload` or index text via `/documents/text`.\n"
         "2. Ask questions via `/query` — the LangGraph pipeline retrieves, grades and "
-        "synthesises an answer from your knowledge base."
+        "synthesises an answer from your knowledge base.\n"
+        "3. Ask questions via `/chat/react-agent` — a ReAct-style agent decides when to call "
+        "retrieval or metadata tools before producing a grounded answer.\n"
+        "4. Stream React Agent output via `/chat/react-agent/stream` as NDJSON events for progressive UI updates."
     ),
     version="1.0.0",
 )
