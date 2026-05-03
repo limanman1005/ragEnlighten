@@ -17,6 +17,29 @@ class QueryRequest(BaseModel):
     )
 
 
+class ChatHistoryMessage(BaseModel):
+    """A single message used to provide chat history to the React Agent endpoint."""
+
+    role: str = Field(
+        default="user",
+        description="Message role: user, assistant, or system",
+    )
+    content: str = Field(..., min_length=1, description="Message content")
+    reasoning_content: str | None = Field(
+        default=None,
+        description="Optional hidden reasoning content returned by reasoning models and required for follow-up turns",
+    )
+
+
+class ReactAgentQueryRequest(QueryRequest):
+    """Request body for the React Agent chat endpoint."""
+
+    history: list[ChatHistoryMessage] = Field(
+        default_factory=list,
+        description="Optional prior chat messages for multi-turn conversations",
+    )
+
+
 class DeleteDocumentRequest(BaseModel):
     """Request body for the /documents/{doc_id} DELETE endpoint."""
 
@@ -67,17 +90,27 @@ class ValidationReport(BaseModel):
     issues: list[str] = Field(default_factory=list)
 
 
+class DebugEvent(BaseModel):
+    """A single agent debug event for tracing internal execution phases."""
+
+    phase: str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class QueryResponse(BaseModel):
     """Response body for the /query endpoint."""
 
     question: str
     answer: str
+    reasoning_content: str | None = None
     question_type: str = "document_qa"
     route: str = "rag"
     plan: list[str] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
     sources: list[SourceDocument] = Field(default_factory=list)
     trace: list[str] = Field(default_factory=list)
+    debug_events: list[DebugEvent] = Field(default_factory=list)
     confidence_score: float | None = None
     needs_human_review: bool = False
     human_review_reason: str | None = None

@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
 from app.core.graph import get_rag_graph
 from app.models.schemas import (
     CollectionInfo,
+    DebugEvent,
     DeleteDocumentRequest,
     DeleteResponse,
     HealthResponse,
     IndexResponse,
     ListCollectionsResponse,
+    ReactAgentQueryRequest,
     QueryRequest,
     QueryResponse,
     SourceDocument,
@@ -27,9 +31,51 @@ from app.services.indexing import (
     index_text,
     list_collections,
 )
+from app.services.react_agent import run_react_agent_query, stream_react_agent_query
 
 router = APIRouter()
 logger = logging.getLogger("uvicorn.error")
+
+
+def _build_source_documents(documents: list) -> list[SourceDocument]:
+    return [
+        SourceDocument(
+            source=doc.metadata.get("source", ""),
+            page=doc.metadata.get("page"),
+            section_path=doc.metadata.get("section_path"),
+            parent_chunk_id=doc.metadata.get("parent_chunk_id"),
+            retrieval_score=doc.metadata.get("retrieval_score"),
+            retrieval_hop=doc.metadata.get("retrieval_hop"),
+            content=(doc.metadata.get("content_preview") or doc.page_content)[: settings.source_preview_chars],
+        )
+        for doc in documents
+    ]
+
+
+def _build_query_response(question: str, result: dict) -> QueryResponse:
+    sources = _build_source_documents(result.get("documents", []))
+    validation = result.get("validation") or {}
+    return QueryResponse(
+        question=question,
+        answer=result.get("answer", ""),
+        reasoning_content=result.get("reasoning_content"),
+        question_type=result.get("question_type", "document_qa"),
+        route=result.get("route", "react_agent"),
+        plan=result.get("plan", []),
+        tool_calls=[ToolCall(**call) for call in result.get("tool_calls", [])],
+        sources=sources,
+        trace=result.get("trace", []),
+        debug_events=[DebugEvent(**event) for event in result.get("debug_events", [])],
+        confidence_score=result.get("confidence_score"),
+        needs_human_review=result.get("needs_human_review", False),
+        human_review_reason=result.get("human_review_reason"),
+        validation=ValidationReport(
+            passed=validation.get("passed", False),
+            confidence=validation.get("confidence"),
+            citations_verified=validation.get("citations_verified", False),
+            issues=validation.get("issues", []),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -255,28 +301,19 @@ async def query(body: QueryRequest) -> QueryResponse:
             detail=f"RAG pipeline error: {exc}",
         ) from exc
 
-    sources = [
-        SourceDocument(
-            source=doc.metadata.get("source", ""),
-            page=doc.metadata.get("page"),
-            section_path=doc.metadata.get("section_path"),
-            parent_chunk_id=doc.metadata.get("parent_chunk_id"),
-            retrieval_score=doc.metadata.get("retrieval_score"),
-            retrieval_hop=doc.metadata.get("retrieval_hop"),
-            content=(doc.metadata.get("content_preview") or doc.page_content)[: settings.source_preview_chars],
-        )
-        for doc in final_state.get("documents", [])
-    ]
+    sources = _build_source_documents(final_state.get("documents", []))
 
     response = QueryResponse(
         question=body.question,
         answer=final_state["answer"],
+        reasoning_content=final_state.get("reasoning_content"),
         question_type=final_state.get("question_type", "document_qa"),
         route=final_state.get("route", "rag"),
         plan=final_state.get("plan_steps", []),
         tool_calls=[ToolCall(**call) for call in final_state.get("tool_calls", [])],
         sources=sources,
         trace=final_state.get("trace", []),
+        debug_events=[DebugEvent(**event) for event in final_state.get("debug_events", [])],
         confidence_score=final_state.get("confidence_score"),
         needs_human_review=final_state.get("needs_human_review", False),
         human_review_reason=final_state.get("human_review_reason") or None,
@@ -294,3 +331,76 @@ async def query(body: QueryRequest) -> QueryResponse:
         len(response.answer),
     )
     return response
+
+
+@router.post(
+    "/chat/react-agent",
+    response_model=QueryResponse,
+    tags=["Chat"],
+)
+async def chat_with_react_agent(body: ReactAgentQueryRequest) -> QueryResponse:
+    """Answer a question using a ReAct-style agent loop with retrieval tools."""
+    logger.info(
+        "[react_agent.chat] start collection=%s question=%s history=%s",
+        body.collection_name or settings.chroma_collection_name,
+        body.question[:120],
+        len(body.history),
+    )
+
+    try:
+        result = await run_react_agent_query(
+            question=body.question,
+            collection_name=body.collection_name,
+            history=[item.model_dump() for item in body.history],
+        )
+    except Exception as exc:
+        logger.exception("[react_agent.chat] agent failed collection=%s", body.collection_name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"React Agent pipeline error: {exc}",
+        ) from exc
+
+    response = _build_query_response(body.question, result)
+    logger.info(
+        "[react_agent.chat] complete collection=%s sources=%s answer_chars=%s",
+        body.collection_name or settings.chroma_collection_name,
+        len(response.sources),
+        len(response.answer),
+    )
+    return response
+
+
+@router.post(
+    "/chat/react-agent/stream",
+    tags=["Chat"],
+)
+async def stream_chat_with_react_agent(body: ReactAgentQueryRequest) -> StreamingResponse:
+    """Stream React Agent progress and final answer as NDJSON events."""
+
+    async def event_generator():
+        try:
+            async for event in stream_react_agent_query(
+                question=body.question,
+                collection_name=body.collection_name,
+                history=[item.model_dump() for item in body.history],
+            ):
+                if event.get("type") == "final":
+                    response = _build_query_response(body.question, event.get("data", {}))
+                    payload = {"type": "final", "data": response.model_dump(mode="json")}
+                else:
+                    payload = event
+                yield json.dumps(payload, ensure_ascii=False) + "\n"
+        except Exception as exc:
+            logger.exception("[react_agent.stream] agent failed collection=%s", body.collection_name)
+            yield json.dumps(
+                {"type": "error", "data": f"React Agent stream error: {exc}"},
+                ensure_ascii=False,
+            ) + "\n"
+
+    logger.info(
+        "[react_agent.stream] start collection=%s question=%s history=%s",
+        body.collection_name or settings.chroma_collection_name,
+        body.question[:120],
+        len(body.history),
+    )
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
