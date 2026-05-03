@@ -47,13 +47,39 @@ class SourceDocument(BaseModel):
     content: str = Field(description="Text excerpt of the retrieved chunk")
 
 
+class ToolCall(BaseModel):
+    """A single tool invocation recorded during the agent workflow."""
+
+    name: str
+    status: str
+    input_summary: str = ""
+    output_summary: str = ""
+
+
+class ValidationReport(BaseModel):
+    """Validation outcome for the generated answer."""
+
+    passed: bool
+    confidence: float | None = None
+    citations_verified: bool = False
+    issues: list[str] = Field(default_factory=list)
+
+
 class QueryResponse(BaseModel):
     """Response body for the /query endpoint."""
 
     question: str
     answer: str
+    question_type: str = "document_qa"
+    route: str = "rag"
+    plan: list[str] = Field(default_factory=list)
+    tool_calls: list[ToolCall] = Field(default_factory=list)
     sources: list[SourceDocument] = Field(default_factory=list)
     trace: list[str] = Field(default_factory=list)
+    confidence_score: float | None = None
+    needs_human_review: bool = False
+    human_review_reason: str | None = None
+    validation: ValidationReport | None = None
 
 
 class IndexResponse(BaseModel):

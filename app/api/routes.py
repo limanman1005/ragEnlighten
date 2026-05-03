@@ -18,6 +18,8 @@ from app.models.schemas import (
     QueryRequest,
     QueryResponse,
     SourceDocument,
+    ToolCall,
+    ValidationReport,
 )
 from app.services.indexing import (
     delete_document,
@@ -228,6 +230,20 @@ async def query(body: QueryRequest) -> QueryResponse:
         "answer": "",
         "trace": ["1. Query accepted by API"],
         "retrieval_hop": 0,
+        "question_type": "document_qa",
+        "route": "rag",
+        "risk_level": "low",
+        "plan_steps": [],
+        "planned_tools": [],
+        "tool_calls": [],
+        "tool_context": [],
+        "confidence_score": None,
+        "validation_passed": False,
+        "validation_issues": [],
+        "citations_verified": False,
+        "retry_count": 0,
+        "needs_human_review": False,
+        "human_review_reason": "",
     }
 
     try:
@@ -253,8 +269,21 @@ async def query(body: QueryRequest) -> QueryResponse:
     response = QueryResponse(
         question=body.question,
         answer=final_state["answer"],
+        question_type=final_state.get("question_type", "document_qa"),
+        route=final_state.get("route", "rag"),
+        plan=final_state.get("plan_steps", []),
+        tool_calls=[ToolCall(**call) for call in final_state.get("tool_calls", [])],
         sources=sources,
         trace=final_state.get("trace", []),
+        confidence_score=final_state.get("confidence_score"),
+        needs_human_review=final_state.get("needs_human_review", False),
+        human_review_reason=final_state.get("human_review_reason") or None,
+        validation=ValidationReport(
+            passed=final_state.get("validation_passed", False),
+            confidence=final_state.get("confidence_score"),
+            citations_verified=final_state.get("citations_verified", False),
+            issues=final_state.get("validation_issues", []),
+        ),
     )
     logger.info(
         "[rag.query] complete collection=%s sources=%s answer_chars=%s",
