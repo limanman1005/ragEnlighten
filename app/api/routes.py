@@ -223,6 +223,7 @@ async def query(body: QueryRequest) -> QueryResponse:
         "collection_name": body.collection_name,
         "documents": [],
         "answer": "",
+        "trace": ["0. Query accepted by API"],
     }
 
     try:
@@ -247,6 +248,7 @@ async def query(body: QueryRequest) -> QueryResponse:
         question=body.question,
         answer=final_state["answer"],
         sources=sources,
+        trace=final_state.get("trace", []),
     )
     logger.info(
         "[rag.query] complete collection=%s sources=%s answer_chars=%s",
