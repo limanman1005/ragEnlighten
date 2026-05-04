@@ -470,6 +470,7 @@ def retrieve(state: RAGState) -> RAGState:
     scored_docs = vs.similarity_search_with_relevance_scores(
         state.get("current_query") or state["question"],
         k=settings.retriever_top_k,
+        filter={"chunk_level": "child"},
     )
     docs: list[Document] = []
     scores: list[str] = []

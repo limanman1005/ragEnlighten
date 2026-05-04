@@ -69,8 +69,13 @@ class SourceDocument(BaseModel):
 
     source: str = Field(default="", description="Source file or URL")
     page: int | None = Field(default=None, description="Page number (if available)")
+    title: str | None = Field(default=None, description="Chunk title when available")
+    chunk_level: str | None = Field(default=None, description="Whether this source is a parent or child chunk")
     section_path: str | None = Field(default=None, description="Hierarchical section path for this chunk")
     parent_chunk_id: str | None = Field(default=None, description="Parent chunk identifier for this child chunk")
+    parent_title: str | None = Field(default=None, description="Title of the parent chunk used as broader context")
+    parent_section_path: str | None = Field(default=None, description="Section path of the parent chunk")
+    parent_content: str | None = Field(default=None, description="Preview of the parent chunk that was included in the model context")
     retrieval_score: float | None = Field(
         default=None,
         description="Similarity score returned by the vector retrieval stage",
@@ -166,11 +171,21 @@ class ChunkRecord(BaseModel):
     page: int | None = None
     source_type: str | None = None
     chunk_level: str | None = None
+    title: str | None = None
+    tags: list[str] = Field(default_factory=list)
     section_path: str | None = None
     parent_section_path: str | None = None
     parent_chunk_id: str | None = None
     parent_chunk_index: int | None = None
     child_chunk_index: int | None = None
+    child_chunk_count: int | None = None
+    child_chunk_start_index: int | None = None
+    child_chunk_end_index: int | None = None
+    document_id: str | None = None
+    section_depth: int | None = None
+    chunk_size: int | None = None
+    chunk_overlap: int | None = None
+    has_children: bool | None = None
     start_index: int | None = None
     content: str
 
