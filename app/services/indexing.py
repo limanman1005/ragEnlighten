@@ -47,6 +47,10 @@ _YEAR_RANGE_HEADING_RE = re.compile(
 )
 _SECTION_BREAK_RE = re.compile(r"\n(?:目录|contents)\b.*?(?=\n\S|$)", re.IGNORECASE | re.DOTALL)
 _TAG_SPLIT_RE = re.compile(r"[\s/|｜·•,，;；:：()\[\]{}]+")
+_CLAUSE_HEADING_RE = re.compile(
+    r"^(第[\d一二三四五六七八九十百千]+(?:章|节|条|款|项)|[（(]?[\d一二三四五六七八九十]+[)）.、])\s*.+$"
+)
+_KEY_VALUE_LINE_RE = re.compile(r"^[^:：\n]{1,40}\s*[:：]\s*\S.+$")
 
 _CHUNKING_PROFILES: dict[str, dict[str, object]] = {
     "md": {
@@ -79,6 +83,30 @@ _CHUNKING_PROFILES: dict[str, dict[str, object]] = {
     },
 }
 
+_STRUCTURE_CHUNKING_PROFILES: dict[str, dict[str, object]] = {
+    "strong_structured": {
+        "separators": ["\n# ", "\n## ", "\n### ", "\n\n", "\n第", "\n", "。", ". ", " ", ""],
+        "parent_size": 2200,
+        "parent_overlap": 260,
+        "child_size": 650,
+        "child_overlap": 120,
+    },
+    "weak_structured": {
+        "separators": ["\n\n", "\n", "。", "；", ". ", "; ", " ", ""],
+        "parent_size": 1500,
+        "parent_overlap": 220,
+        "child_size": 480,
+        "child_overlap": 90,
+    },
+    "semi_structured": {
+        "separators": ["\n\n", "\n", "；", "; ", "。", ". ", ""],
+        "parent_size": 1400,
+        "parent_overlap": 320,
+        "child_size": 520,
+        "child_overlap": 180,
+    },
+}
+
 
 def _detect_source_type(metadata: dict[str, object]) -> str:
     source_type = str(metadata.get("source_type", "")).strip().lower()
@@ -89,7 +117,53 @@ def _detect_source_type(metadata: dict[str, object]) -> str:
     return suffix or "text"
 
 
-def _clean_text(text: str, source_type: str) -> str:
+def _is_table_like_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.count("|") >= 2 or "\t" in stripped:
+        return True
+    if _KEY_VALUE_LINE_RE.match(stripped):
+        return True
+    return bool(re.search(r"\S(?:\s{2,}|\t)\S(?:\s{2,}|\t)\S", stripped))
+
+
+def _classify_document_structure(text: str, source_type: str) -> tuple[str, dict[str, int | float]]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    paragraphs = [block.strip() for block in re.split(r"\n{2,}", text) if block.strip()]
+    heading_lines = sum(
+        1 for line in lines if _infer_heading(line, source_type) is not None or _CLAUSE_HEADING_RE.match(line)
+    )
+    table_lines = sum(1 for line in lines if _is_table_like_line(line))
+    key_value_lines = sum(1 for line in lines if _KEY_VALUE_LINE_RE.match(line))
+    long_paragraphs = sum(1 for block in paragraphs if len(block) >= 220)
+    total_lines = max(1, len(lines))
+    total_paragraphs = max(1, len(paragraphs))
+
+    if source_type == "md":
+        structure = "strong_structured"
+    elif table_lines >= max(3, total_lines // 3) or key_value_lines >= max(4, total_lines // 4):
+        structure = "semi_structured"
+    elif heading_lines >= 3 and heading_lines / total_lines >= 0.08:
+        structure = "strong_structured"
+    elif source_type in {"pdf", "docx"} and (table_lines + key_value_lines) >= 4:
+        structure = "semi_structured"
+    elif long_paragraphs >= max(2, total_paragraphs // 2):
+        structure = "weak_structured"
+    else:
+        structure = "weak_structured"
+
+    return structure, {
+        "heading_lines": heading_lines,
+        "table_lines": table_lines,
+        "key_value_lines": key_value_lines,
+        "paragraphs": len(paragraphs),
+        "long_paragraphs": long_paragraphs,
+        "nonempty_lines": len(lines),
+    }
+
+
+def _clean_text(text: str, source_type: str, document_structure: str | None = None) -> str:
     cleaned = text.replace("\x00", " ").replace("\ufeff", "")
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = cleaned.replace("\t", "    ")
@@ -99,7 +173,7 @@ def _clean_text(text: str, source_type: str) -> str:
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
 
-    if source_type in {"pdf", "docx", "txt", "text"}:
+    if source_type in {"pdf", "docx", "txt", "text"} and document_structure == "weak_structured":
         cleaned = re.sub(r"(?<![\n])\n(?=[^\n•\-\d#])", " ", cleaned)
         cleaned = re.sub(r" {2,}", " ", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -138,18 +212,194 @@ def _infer_heading(line: str, source_type: str) -> tuple[int, str] | None:
     return None
 
 
+def _is_markdown_fence_line(line: str) -> bool:
+    stripped = line.lstrip()
+    return stripped.startswith("```") or stripped.startswith("~~~")
+
+
+def _split_markdown_logical_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    current_lines: list[str] = []
+    code_lines: list[str] = []
+    in_code_block = False
+
+    def flush_current() -> None:
+        nonlocal current_lines
+        block = "\n".join(current_lines).strip()
+        if block:
+            blocks.append(block)
+        current_lines = []
+
+    for raw_line in text.split("\n"):
+        if _is_markdown_fence_line(raw_line):
+            if in_code_block:
+                code_lines.append(raw_line)
+                block = "\n".join(code_lines).strip()
+                if block:
+                    blocks.append(block)
+                code_lines = []
+                in_code_block = False
+            else:
+                flush_current()
+                code_lines = [raw_line]
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            code_lines.append(raw_line)
+            continue
+
+        stripped = raw_line.strip()
+        if not stripped:
+            flush_current()
+            continue
+
+        if _MARKDOWN_HEADING_RE.match(stripped):
+            flush_current()
+            blocks.append(stripped)
+            continue
+
+        current_lines.append(raw_line)
+
+    if code_lines:
+        block = "\n".join(code_lines).strip()
+        if block:
+            blocks.append(block)
+    flush_current()
+    return blocks
+
+
+def _build_markdown_chunk_documents(
+    doc: Document,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> list[Document]:
+    text = doc.page_content.strip()
+    if not text:
+        return []
+
+    blocks = _split_markdown_logical_blocks(text)
+    if not blocks:
+        return []
+
+    chunks: list[Document] = []
+    current_blocks: list[str] = []
+
+    def current_text() -> str:
+        return "\n\n".join(current_blocks).strip()
+
+    def emit_chunk(content: str) -> None:
+        if not content:
+            return
+        metadata = dict(doc.metadata)
+        start_index = text.find(content)
+        if start_index >= 0:
+            metadata["start_index"] = start_index
+        chunks.append(Document(page_content=content, metadata=metadata))
+
+    for block in blocks:
+        if block.startswith("```") or block.startswith("~~~"):
+            if current_blocks and len(current_text()) + 2 + len(block) > chunk_size:
+                emitted = current_text()
+                emit_chunk(emitted)
+                overlap_blocks: list[str] = []
+                overlap_chars = 0
+                for tail_block in reversed(current_blocks):
+                    if tail_block.startswith("```") or tail_block.startswith("~~~"):
+                        continue
+                    overlap_blocks.insert(0, tail_block)
+                    overlap_chars += len(tail_block)
+                    if overlap_chars >= chunk_overlap:
+                        break
+                current_blocks = overlap_blocks
+            current_blocks.append(block)
+            if len(block) >= chunk_size:
+                emit_chunk(current_text())
+                current_blocks = []
+            continue
+
+        candidate_blocks = [*current_blocks, block]
+        candidate_text = "\n\n".join(candidate_blocks).strip()
+        if current_blocks and len(candidate_text) > chunk_size:
+            emitted = current_text()
+            emit_chunk(emitted)
+            overlap_blocks = []
+            overlap_chars = 0
+            for tail_block in reversed(current_blocks):
+                if tail_block.startswith("```") or tail_block.startswith("~~~"):
+                    continue
+                overlap_blocks.insert(0, tail_block)
+                overlap_chars += len(tail_block)
+                if overlap_chars >= chunk_overlap:
+                    break
+            current_blocks = overlap_blocks
+            if len(block) > chunk_size:
+                emit_chunk(block)
+                current_blocks = []
+            else:
+                current_blocks.append(block)
+            continue
+
+        current_blocks = candidate_blocks
+
+    emit_chunk(current_text())
+    return chunks
+
+
+def _apply_structure_metadata(
+    metadata: dict[str, object],
+    document_structure: str,
+    structure_metrics: dict[str, int | float],
+) -> None:
+    metadata["document_structure"] = document_structure
+    metadata["chunk_strategy"] = document_structure
+    metadata["structure_heading_lines"] = int(structure_metrics.get("heading_lines", 0))
+    metadata["structure_table_lines"] = int(structure_metrics.get("table_lines", 0))
+    metadata["structure_key_value_lines"] = int(structure_metrics.get("key_value_lines", 0))
+    metadata["structure_paragraphs"] = int(structure_metrics.get("paragraphs", 0))
+    metadata["structure_long_paragraphs"] = int(structure_metrics.get("long_paragraphs", 0))
+    metadata["structure_nonempty_lines"] = int(structure_metrics.get("nonempty_lines", 0))
+
+
 def _build_section_documents(docs: list[Document]) -> list[Document]:
     section_docs: list[Document] = []
 
     for doc_index, doc in enumerate(docs):
         source_type = _detect_source_type(doc.metadata)
-        cleaned_text = _clean_text(doc.page_content, source_type)
+        document_structure, structure_metrics = _classify_document_structure(doc.page_content, source_type)
+        cleaned_text = _clean_text(doc.page_content, source_type, document_structure)
         if not cleaned_text:
+            continue
+
+        logger.info(
+            "[indexing.structure] source=%s source_type=%s structure=%s headings=%s table_lines=%s paragraphs=%s",
+            doc.metadata.get("source", ""),
+            source_type,
+            document_structure,
+            structure_metrics["heading_lines"],
+            structure_metrics["table_lines"],
+            structure_metrics["paragraphs"],
+        )
+
+        if document_structure == "semi_structured":
+            blocks = [block.strip() for block in re.split(r"\n{2,}", cleaned_text) if block.strip()]
+            for block_index, block in enumerate(blocks or [cleaned_text], start=1):
+                metadata = dict(doc.metadata)
+                metadata["source_type"] = source_type
+                _apply_structure_metadata(metadata, document_structure, structure_metrics)
+                metadata["layout_parser"] = "table-aware-layout"
+                metadata["section_path"] = (
+                    f"table_block_{block_index}" if len(blocks) > 1 else (doc.metadata.get("section_path") or "root")
+                )
+                metadata["document_index"] = doc_index
+                metadata["cleaned_chars"] = len(block)
+                section_docs.append(Document(page_content=block, metadata=metadata))
             continue
 
         heading_stack: list[str] = []
         current_buffer: list[str] = []
         current_section_path = doc.metadata.get("section_path") or "root"
+        in_code_block = False
 
         def flush_section() -> None:
             nonlocal current_buffer
@@ -160,6 +410,7 @@ def _build_section_documents(docs: list[Document]) -> list[Document]:
 
             metadata = dict(doc.metadata)
             metadata["source_type"] = source_type
+            _apply_structure_metadata(metadata, document_structure, structure_metrics)
             metadata["layout_parser"] = "markdown-headings" if source_type == "md" else "heuristic-layout"
             metadata["section_path"] = current_section_path
             metadata["document_index"] = doc_index
@@ -168,6 +419,15 @@ def _build_section_documents(docs: list[Document]) -> list[Document]:
             current_buffer = []
 
         for raw_line in cleaned_text.split("\n"):
+            if source_type == "md" and _is_markdown_fence_line(raw_line):
+                current_buffer.append(raw_line)
+                in_code_block = not in_code_block
+                continue
+
+            if in_code_block:
+                current_buffer.append(raw_line)
+                continue
+
             stripped = raw_line.strip()
             heading = _infer_heading(stripped, source_type)
             if heading:
@@ -186,6 +446,7 @@ def _build_section_documents(docs: list[Document]) -> list[Document]:
         if not section_docs or section_docs[-1].metadata.get("document_index") != doc_index:
             metadata = dict(doc.metadata)
             metadata["source_type"] = source_type
+            _apply_structure_metadata(metadata, document_structure, structure_metrics)
             metadata["layout_parser"] = "fallback-whole-document"
             metadata["section_path"] = current_section_path
             metadata["document_index"] = doc_index
@@ -195,8 +456,24 @@ def _build_section_documents(docs: list[Document]) -> list[Document]:
     return section_docs
 
 
-def _build_splitter(source_type: str, level: str) -> RecursiveCharacterTextSplitter:
-    profile = _CHUNKING_PROFILES.get(source_type, _CHUNKING_PROFILES["default"])
+def _resolve_chunk_profile_key(metadata: dict[str, object]) -> str:
+    document_structure = str(metadata.get("document_structure", "")).strip()
+    if document_structure in _STRUCTURE_CHUNKING_PROFILES:
+        return document_structure
+    source_type = _detect_source_type(metadata)
+    if source_type in _CHUNKING_PROFILES:
+        return source_type
+    return "default"
+
+
+def _get_chunking_profile(profile_key: str) -> dict[str, object]:
+    if profile_key in _STRUCTURE_CHUNKING_PROFILES:
+        return _STRUCTURE_CHUNKING_PROFILES[profile_key]
+    return _CHUNKING_PROFILES.get(profile_key, _CHUNKING_PROFILES["default"])
+
+
+def _build_splitter(profile_key: str, level: str) -> RecursiveCharacterTextSplitter:
+    profile = _get_chunking_profile(profile_key)
     separators = profile["separators"]
     if level == "parent":
         chunk_size = int(profile["parent_size"])
@@ -212,8 +489,8 @@ def _build_splitter(source_type: str, level: str) -> RecursiveCharacterTextSplit
     )
 
 
-def _get_chunk_profile(source_type: str, level: str) -> tuple[int, int]:
-    profile = _CHUNKING_PROFILES.get(source_type, _CHUNKING_PROFILES["default"])
+def _get_chunk_profile(profile_key: str, level: str) -> tuple[int, int]:
+    profile = _get_chunking_profile(profile_key)
     if level == "parent":
         return int(profile["parent_size"]), int(profile["parent_overlap"])
     return int(profile["child_size"]), int(profile["child_overlap"])
@@ -303,10 +580,14 @@ def _build_parent_child_chunks(section_docs: list[Document]) -> tuple[list[Docum
 
     for section_index, section_doc in enumerate(section_docs):
         source_type = _detect_source_type(section_doc.metadata)
-        parent_splitter = _build_splitter(source_type, "parent")
-        parent_chunk_size, parent_chunk_overlap = _get_chunk_profile(source_type, "parent")
-        child_chunk_size, child_chunk_overlap = _get_chunk_profile(source_type, "child")
-        parent_docs = parent_splitter.split_documents([section_doc])
+        profile_key = _resolve_chunk_profile_key(section_doc.metadata)
+        parent_chunk_size, parent_chunk_overlap = _get_chunk_profile(profile_key, "parent")
+        child_chunk_size, child_chunk_overlap = _get_chunk_profile(profile_key, "child")
+        if source_type == "md":
+            parent_docs = _build_markdown_chunk_documents(section_doc, parent_chunk_size, parent_chunk_overlap)
+        else:
+            parent_splitter = _build_splitter(profile_key, "parent")
+            parent_docs = parent_splitter.split_documents([section_doc])
 
         for parent_index, parent_doc in enumerate(parent_docs):
             parent_metadata = dict(parent_doc.metadata)
@@ -316,8 +597,11 @@ def _build_parent_child_chunks(section_docs: list[Document]) -> tuple[list[Docum
                 parent_metadata,
             )
             child_seed = Document(page_content=parent_preview, metadata=parent_metadata)
-            child_splitter = _build_splitter(source_type, "child")
-            child_docs = child_splitter.split_documents([child_seed])
+            if source_type == "md":
+                child_docs = _build_markdown_chunk_documents(child_seed, child_chunk_size, child_chunk_overlap)
+            else:
+                child_splitter = _build_splitter(profile_key, "child")
+                child_docs = child_splitter.split_documents([child_seed])
             child_chunk_count = len(child_docs)
             parent_metadata["chunk_level"] = "parent"
             parent_title, parent_tags = _extract_title_and_tags(parent_metadata, parent_preview)
@@ -331,6 +615,7 @@ def _build_parent_child_chunks(section_docs: list[Document]) -> tuple[list[Docum
                     "section_index": section_index,
                     "section_depth": len(str(parent_metadata.get("section_path", "root")).split("/")),
                     "parent_section_path": parent_metadata.get("section_path", "root"),
+                    "chunk_strategy": profile_key,
                     "chunk_size": parent_chunk_size,
                     "chunk_overlap": parent_chunk_overlap,
                     "has_children": child_chunk_count > 0,
@@ -360,6 +645,7 @@ def _build_parent_child_chunks(section_docs: list[Document]) -> tuple[list[Docum
                         "section_path": child_metadata.get("section_path", "root"),
                         "parent_section_path": child_metadata.get("parent_section_path", "root"),
                         "section_depth": len(str(child_metadata.get("section_path", "root")).split("/")),
+                        "chunk_strategy": profile_key,
                         "chunk_size": child_chunk_size,
                         "chunk_overlap": child_chunk_overlap,
                         "has_children": False,
