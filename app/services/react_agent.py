@@ -10,8 +10,8 @@ from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_core.tools import tool
+from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
 
 from app.core.config import settings
 from app.services.indexing import get_parent_chunks_by_ids, get_vectorstore, list_collections
@@ -532,7 +532,9 @@ def _build_agent_runtime(collection_name: str | None = None):
             enriched_tool_docs.append(Document(page_content=tool_doc.page_content, metadata=metadata))
 
         retrieval_audit = _build_retrieval_audit_text(enriched_tool_docs, parent_docs)
-        documents = _merge_documents(documents, enriched_tool_docs)
+        merged_documents = _merge_documents(documents, enriched_tool_docs)
+        documents.clear()
+        documents.extend(merged_documents)
         logger.info(
             "[react_agent.tool.search] complete results=%s parent_results=%s merged_documents=%s\n%s",
             len(enriched_tool_docs),
@@ -563,10 +565,10 @@ def _build_agent_runtime(collection_name: str | None = None):
         "Base your final answer only on tool results. If the tools do not provide enough information, say so directly. "
         "Keep answers concise and grounded."
     )
-    agent = create_react_agent(
+    agent = create_agent(
         model=_get_llm(),
         tools=[knowledge_base_search, collection_overview],
-        prompt=prompt,
+        system_prompt=prompt,
         name="rag_react_agent",
     )
     logger.info("[react_agent.runtime] ready tools=%s", 2)
