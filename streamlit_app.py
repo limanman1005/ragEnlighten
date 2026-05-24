@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 
 
-DEFAULT_BACKEND_URL = "http://127.0.0.1:8004/api/v1"
+DEFAULT_BACKEND_URL = "http://127.0.0.1:8000/api/v1"
 REQUEST_TIMEOUT_SECONDS = 300
 
 

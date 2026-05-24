@@ -15,9 +15,10 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable
 
 from app.core.config import settings
+from app.services.web_search import run_web_search
 logger = logging.getLogger("uvicorn.error")
 
-_ALLOWED_PLAN_TOOLS = {"knowledge_base_search", "collection_overview", "answer_synthesis"}
+_ALLOWED_PLAN_TOOLS = {"knowledge_base_search", "collection_overview", "web_search", "answer_synthesis"}
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,8 @@ def _normalize_plan_tool(tool: str) -> str:
     normalized = tool.strip().lower()
     if normalized in {"search", "retrieval", "retrieve", "knowledge_base_retrieval"}:
         return "knowledge_base_search"
+    if normalized in {"web", "web_search", "internet", "internet_search", "external_search"}:
+        return "web_search"
     if normalized in {"metadata", "internal_api", "system_info"}:
         return "collection_overview"
     if normalized in {"synthesize", "generate", "answer"}:
@@ -160,8 +163,9 @@ def _build_planning_prompt():
                     "You are a planning module for a plan-and-execute RAG agent. "
                     "Create the full execution plan before any tools are used. "
                     "Return JSON only with key steps. Each step must have id, purpose, tool, and query. "
-                    "Allowed tools: knowledge_base_search, collection_overview, answer_synthesis. "
+                    "Allowed tools: knowledge_base_search, collection_overview, web_search, answer_synthesis. "
                     "Use knowledge_base_search for document or knowledge-base questions. "
+                    "Use web_search for external or current information that is not available in the indexed knowledge base. "
                     "Use collection_overview only for questions about model configuration, collections, or service metadata. "
                     "The last step should be answer_synthesis."
                 ),
@@ -323,6 +327,7 @@ async def _execute_plan_steps(
     *,
     search: Callable[[str], Any],
     overview: Callable[[], Any],
+    web_search: Callable[[str], Any] | None = None,
 ) -> PlanExecutionResult:
     documents: list[Document] = []
     tool_calls: list[dict[str, str]] = []
@@ -346,18 +351,27 @@ async def _execute_plan_steps(
         if step.tool == "knowledge_base_search":
             output, docs = await _maybe_await(search(step.query))
             documents = _merge_documents(documents, docs)
+        elif step.tool == "web_search":
+            try:
+                output, docs = await _maybe_await((web_search or run_web_search)(step.query))
+            except Exception as exc:
+                output = f"Web search failed: {exc}"
+                docs = []
+            documents = _merge_documents(documents, docs)
         elif step.tool == "collection_overview":
             output = await _maybe_await(overview())
         else:
             continue
 
-        tool_context.append(str(output))
+        output_text = str(output)
+        if step.tool != "web_search" or docs:
+            tool_context.append(output_text)
         tool_calls.append(
             {
                 "name": step.tool,
-                "status": "success",
+                "status": "failed" if step.tool == "web_search" and output_text.startswith("Web search failed:") else "success",
                 "input_summary": step.query[:120],
-                "output_summary": str(output)[:1600],
+                "output_summary": output_text[:1600],
             }
         )
         trace.append(f"{len(trace) + 1}. Tool {step.tool} returned a result")
@@ -472,6 +486,7 @@ async def run_plan_execute_agent_query(
         plan,
         search=lambda query: _knowledge_base_search(query, collection_name),
         overview=_collection_overview,
+        web_search=run_web_search,
     )
     execution.trace = [*trace, *execution.trace]
     execution.debug_events = [*debug_events, *execution.debug_events]
@@ -508,6 +523,7 @@ async def stream_plan_execute_agent_query(
         plan,
         search=lambda query: _knowledge_base_search(query, collection_name),
         overview=_collection_overview,
+        web_search=run_web_search,
     )
     for item in execution.trace:
         yield {"type": "trace", "data": item}
