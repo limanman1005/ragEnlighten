@@ -37,6 +37,10 @@ from app.services.indexing import (
     list_chunks,
     list_collections,
 )
+from app.services.plan_execute_agent import (
+    run_plan_execute_agent_query,
+    stream_plan_execute_agent_query,
+)
 from app.services.react_agent import run_react_agent_query, stream_react_agent_query
 
 router = APIRouter()
@@ -487,6 +491,76 @@ async def stream_chat_with_react_agent(body: ReactAgentQueryRequest) -> Streamin
 
     logger.info(
         "[react_agent.stream] start collection=%s question=%s history=%s",
+        body.collection_name or settings.chroma_collection_name,
+        body.question[:120],
+        len(body.history),
+    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post(
+    "/chat/plan-execute-agent",
+    response_model=QueryResponse,
+    tags=["Chat"],
+)
+async def chat_with_plan_execute_agent(body: ReactAgentQueryRequest) -> QueryResponse:
+    """Answer a question by planning first, then executing the completed plan."""
+    logger.info(
+        "[plan_execute.chat] start collection=%s question=%s history=%s",
+        body.collection_name or settings.chroma_collection_name,
+        body.question[:120],
+        len(body.history),
+    )
+
+    try:
+        result = await run_plan_execute_agent_query(
+            question=body.question,
+            collection_name=body.collection_name,
+            history=[item.model_dump() for item in body.history],
+        )
+    except Exception as exc:
+        logger.exception("[plan_execute.chat] agent failed collection=%s", body.collection_name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Plan-Execute Agent pipeline error: {exc}",
+        ) from exc
+
+    response = _build_query_response(body.question, result)
+    logger.info(
+        "[plan_execute.chat] complete collection=%s sources=%s answer_chars=%s",
+        body.collection_name or settings.chroma_collection_name,
+        len(response.sources),
+        len(response.answer),
+    )
+    return response
+
+
+@router.post(
+    "/chat/plan-execute-agent/stream",
+    tags=["Chat"],
+)
+async def stream_chat_with_plan_execute_agent(body: ReactAgentQueryRequest) -> StreamingResponse:
+    """Stream Plan-Execute Agent progress and final answer as Server-Sent Events."""
+
+    async def event_generator():
+        try:
+            async for event in stream_plan_execute_agent_query(
+                question=body.question,
+                collection_name=body.collection_name,
+                history=[item.model_dump() for item in body.history],
+            ):
+                if event.get("type") == "final":
+                    response = _build_query_response(body.question, event.get("data", {}))
+                    payload = {"type": "final", "data": response.model_dump(mode="json")}
+                else:
+                    payload = event
+                yield format_sse_event(str(payload.get("type", "message")), payload.get("data"))
+        except Exception as exc:
+            logger.exception("[plan_execute.stream] agent failed collection=%s", body.collection_name)
+            yield format_sse_event("error", f"Plan-Execute Agent stream error: {exc}")
+
+    logger.info(
+        "[plan_execute.stream] start collection=%s question=%s history=%s",
         body.collection_name or settings.chroma_collection_name,
         body.question[:120],
         len(body.history),
