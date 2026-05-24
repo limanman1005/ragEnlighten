@@ -137,10 +137,36 @@ def _stream_react_agent(
         stream=True,
     ) as response:
         response.raise_for_status()
+        event_type = "message"
+        data_lines: list[str] = []
+
         for line in response.iter_lines(decode_unicode=True):
-            if not line:
+            if line == "":
+                if not data_lines:
+                    event_type = "message"
+                    continue
+                raw_data = "\n".join(data_lines)
+                try:
+                    data = json.loads(raw_data)
+                except json.JSONDecodeError:
+                    data = raw_data
+                yield {"type": event_type, "data": data}
+                event_type = "message"
+                data_lines = []
                 continue
-            yield json.loads(line)
+
+            if line.startswith("event:"):
+                event_type = line.removeprefix("event:").strip() or "message"
+            elif line.startswith("data:"):
+                data_lines.append(line.removeprefix("data:").lstrip())
+
+        if data_lines:
+            raw_data = "\n".join(data_lines)
+            try:
+                data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                data = raw_data
+            yield {"type": event_type, "data": data}
 
 
 def _session_key(chat_mode: str) -> str:

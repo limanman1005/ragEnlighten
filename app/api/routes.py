@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
@@ -10,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
 from app.core.graph import get_rag_graph
+from app.api.sse import format_sse_event
 from app.models.schemas import (
     ChunkRecord,
     CollectionInfo,
@@ -466,7 +466,7 @@ async def chat_with_react_agent(body: ReactAgentQueryRequest) -> QueryResponse:
     tags=["Chat"],
 )
 async def stream_chat_with_react_agent(body: ReactAgentQueryRequest) -> StreamingResponse:
-    """Stream React Agent progress and final answer as NDJSON events."""
+    """Stream React Agent progress and final answer as Server-Sent Events."""
 
     async def event_generator():
         try:
@@ -480,13 +480,10 @@ async def stream_chat_with_react_agent(body: ReactAgentQueryRequest) -> Streamin
                     payload = {"type": "final", "data": response.model_dump(mode="json")}
                 else:
                     payload = event
-                yield json.dumps(payload, ensure_ascii=False) + "\n"
+                yield format_sse_event(str(payload.get("type", "message")), payload.get("data"))
         except Exception as exc:
             logger.exception("[react_agent.stream] agent failed collection=%s", body.collection_name)
-            yield json.dumps(
-                {"type": "error", "data": f"React Agent stream error: {exc}"},
-                ensure_ascii=False,
-            ) + "\n"
+            yield format_sse_event("error", f"React Agent stream error: {exc}")
 
     logger.info(
         "[react_agent.stream] start collection=%s question=%s history=%s",
@@ -494,4 +491,4 @@ async def stream_chat_with_react_agent(body: ReactAgentQueryRequest) -> Streamin
         body.question[:120],
         len(body.history),
     )
-    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
