@@ -14,7 +14,7 @@
 | 文本直接索引 | 可将纯文本片段直接写入知识库 |
 | Agentic RAG 问答 | 基于 LangGraph 的多步流水线：问题分类 → 规划 → 路由 → 查询改写 → 检索 → 相关性评分 → 多跳补充检索 → 生成 → 校验 |
 | React Agent 聊天接口 | 新增 `/api/v1/chat/react-agent`，基于 ReAct 模式按需调用知识库检索工具完成问答，支持传入多轮历史消息 |
-| React Agent 流式接口 | 新增 `/api/v1/chat/react-agent/stream`，以 NDJSON 持续返回 token、trace 和最终结果，适合前端逐步渲染 |
+| React Agent 流式接口 | 新增 `/api/v1/chat/react-agent/stream`，以 SSE（`text/event-stream`）持续返回 token、trace 和最终结果，适合前端逐步渲染 |
 | 多集合管理 | 支持按集合（collection）组织不同领域的知识库 |
 | 校验与人审 | 低置信度答案会重试一次；高风险问题或无证据场景会标记人工复核 |
 | OpenAPI 文档 | FastAPI 自动生成交互式 Swagger UI（`/docs`）和 ReDoc（`/redoc`） |
@@ -114,12 +114,26 @@ START
 - `confidence_score`
 - `validation`
 
-流式接口返回 `application/x-ndjson`，每一行都是一个 JSON 事件，常见事件类型：
+流式接口返回 SSE 协议，响应类型为 `text/event-stream`。每个事件使用 `event:` 标识事件类型，`data:` 携带 JSON 数据，常见事件类型：
 
 - `trace`：执行轨迹更新
+- `debug`：Agent 内部阶段、工具调用和 grounding 状态
 - `token`：增量文本片段
 - `final`：最终完整响应对象
 - `error`：流执行错误
+
+SSE 事件示例：
+
+```text
+event: trace
+data: "1. Query accepted by React Agent stream API"
+
+event: token
+data: "这是增量输出片段"
+
+event: final
+data: {"question":"...","answer":"...","sources":[]}
+```
 
 ---
 

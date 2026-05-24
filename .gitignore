@@ -220,3 +220,7 @@ __marimo__/
 
 # chromea_db directory for vector store persistence
 chroma_db/
+
+
+openspec/
+.cursor/
