@@ -125,13 +125,14 @@ def _stream_react_agent(
     question: str,
     collection_name: str | None,
     history: list[dict[str, Any]],
+    stream_path: str = "/chat/react-agent/stream",
 ):
     payload: dict[str, Any] = {"question": question, "history": history}
     if collection_name:
         payload["collection_name"] = collection_name
 
     with requests.post(
-        f"{base_url}/chat/react-agent/stream",
+        f"{base_url}{stream_path}",
         json=payload,
         timeout=REQUEST_TIMEOUT_SECONDS,
         stream=True,
@@ -170,7 +171,11 @@ def _stream_react_agent(
 
 
 def _session_key(chat_mode: str) -> str:
-    return "react_agent" if chat_mode == "React Agent" else "langgraph"
+    if chat_mode == "React Agent":
+        return "react_agent"
+    if chat_mode == "Plan Execute Agent":
+        return "plan_execute_agent"
+    return "langgraph"
 
 
 def _build_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -261,7 +266,13 @@ def _render_debug_panel(events: list[dict[str, Any]]) -> None:
 
 def _init_state() -> None:
     if "chat_sessions" not in st.session_state:
-        st.session_state.chat_sessions = {"langgraph": [], "react_agent": []}
+        st.session_state.chat_sessions = {
+            "langgraph": [],
+            "react_agent": [],
+            "plan_execute_agent": [],
+        }
+    else:
+        st.session_state.chat_sessions.setdefault("plan_execute_agent", [])
     if "collection_names" not in st.session_state:
         st.session_state.collection_names = []
     if "chunk_browser" not in st.session_state:
@@ -451,10 +462,11 @@ with st.sidebar:
     st.session_state["_active_backend_url"] = backend_url
     chat_mode = st.radio(
         "Chat mode",
-        options=["LangGraph", "React Agent"],
+        options=["LangGraph", "React Agent", "Plan Execute Agent"],
         captions=[
             "Use the existing LangGraph pipeline",
             "Use the new React Agent endpoint with streaming output",
+            "Plan first, then execute the completed plan with streaming output",
         ],
     )
     if st.button("Refresh collections", use_container_width=True):
@@ -476,12 +488,12 @@ with st.sidebar:
     st.caption("Current target collection")
     st.code(active_collection or "rag_documents", language=None)
 
-    if chat_mode == "React Agent":
+    if chat_mode in {"React Agent", "Plan Execute Agent"}:
         st.divider()
-        st.subheader("React Agent Session")
+        st.subheader(f"{chat_mode} Session")
         st.caption(f"Current messages in session: {len(active_chat_session)}")
-        if st.button("Clear React Agent Session", use_container_width=True):
-            st.session_state.chat_sessions["react_agent"] = []
+        if st.button(f"Clear {chat_mode} Session", use_container_width=True):
+            st.session_state.chat_sessions[active_session_key] = []
             st.rerun()
         _render_history_preview(active_chat_session)
 
@@ -519,7 +531,8 @@ with upload_tab:
 with chat_tab:
     st.subheader("Ask the knowledge base")
     st.caption(
-        "LangGraph mode uses `/query`. React Agent mode uses the streaming `/chat/react-agent/stream` endpoint."
+        "LangGraph mode uses `/query`. React Agent streams from `/chat/react-agent/stream`. "
+        "Plan Execute Agent streams from `/chat/plan-execute-agent/stream`."
     )
 
     current_session = st.session_state.chat_sessions[_session_key(chat_mode)]
@@ -548,8 +561,13 @@ with chat_tab:
 
         with st.chat_message("assistant"):
             try:
-                if chat_mode == "React Agent":
-                    status = st.status("Streaming React Agent...", expanded=True)
+                if chat_mode in {"React Agent", "Plan Execute Agent"}:
+                    stream_path = (
+                        "/chat/plan-execute-agent/stream"
+                        if chat_mode == "Plan Execute Agent"
+                        else "/chat/react-agent/stream"
+                    )
+                    status = st.status(f"Streaming {chat_mode}...", expanded=True)
                     status.write("Opening streaming connection to FastAPI backend")
                     answer_placeholder = st.empty()
                     streamed_answer = ""
@@ -561,11 +579,16 @@ with chat_tab:
                         question,
                         active_collection,
                         _build_history(current_session[:-1]),
+                        stream_path=stream_path,
                     ):
                         event_type = event.get("type")
                         if event_type == "token":
                             streamed_answer += event.get("data", "")
                             answer_placeholder.markdown(streamed_answer or " ")
+                        elif event_type == "plan":
+                            status.write("Plan created:")
+                            for step in event.get("data", []):
+                                status.write(step)
                         elif event_type == "debug":
                             debug_event = event.get("data", {})
                             streamed_debug_events.append(debug_event)
@@ -580,14 +603,14 @@ with chat_tab:
                             final_result = event.get("data", {})
 
                     if final_result is None:
-                        raise requests.RequestException("React Agent stream ended without a final payload.")
+                        raise requests.RequestException(f"{chat_mode} stream ended without a final payload.")
 
                     trace = final_result.get("trace", [])
                     answer_placeholder.markdown(final_result["answer"])
                     status_label = (
                         "Human review required"
                         if final_result.get("needs_human_review")
-                        else "React Agent stream complete"
+                        else f"{chat_mode} stream complete"
                     )
                     status_state = "error" if final_result.get("needs_human_review") else "complete"
                     status.update(label=status_label, state=status_state)

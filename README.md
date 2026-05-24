@@ -15,6 +15,7 @@
 | Agentic RAG 问答 | 基于 LangGraph 的多步流水线：问题分类 → 规划 → 路由 → 查询改写 → 检索 → 相关性评分 → 多跳补充检索 → 生成 → 校验 |
 | React Agent 聊天接口 | 新增 `/api/v1/chat/react-agent`，基于 ReAct 模式按需调用知识库检索工具完成问答，支持传入多轮历史消息 |
 | React Agent 流式接口 | 新增 `/api/v1/chat/react-agent/stream`，以 SSE（`text/event-stream`）持续返回 token、trace 和最终结果，适合前端逐步渲染 |
+| Plan Execute Agent 接口 | 新增 `/api/v1/chat/plan-execute-agent` 和 `/api/v1/chat/plan-execute-agent/stream`，先生成完整计划，再按计划顺序执行 |
 | 多集合管理 | 支持按集合（collection）组织不同领域的知识库 |
 | 校验与人审 | 低置信度答案会重试一次；高风险问题或无证据场景会标记人工复核 |
 | OpenAPI 文档 | FastAPI 自动生成交互式 Swagger UI（`/docs`）和 ReDoc（`/redoc`） |
@@ -80,9 +81,14 @@ START
 
 流式接口：`POST /api/v1/chat/react-agent/stream`
 
+Plan Execute Agent 接口：`POST /api/v1/chat/plan-execute-agent`
+
+Plan Execute Agent 流式接口：`POST /api/v1/chat/plan-execute-agent/stream`
+
 适用场景：
 
 - 希望使用 ReAct Agent 模式，由模型自主决定何时调用知识库检索工具
+- 希望使用 Plan Execute Agent 模式，让模型先产出完整计划，再按计划执行
 - 需要传入历史消息，支持多轮问答上下文
 - 不想替换现有 LangGraph `/query` 流程，而是并行保留两种问答模式
 
@@ -114,8 +120,15 @@ START
 - `confidence_score`
 - `validation`
 
+### ReAct Agent 与 Plan Execute Agent 的区别
+
+- ReAct Agent 是“边想边做”：模型在循环中动态决定是否调用工具、调用什么工具以及下一步怎么做。
+- Plan Execute Agent 是“先规划再执行”：模型先输出完整 `plan`，后续执行阶段只按这个计划顺序调用工具并汇总答案，不再让模型临时追加工具决策。
+- 如果需要更强适应性，使用 ReAct Agent；如果需要更容易审计、展示和复盘的执行过程，使用 Plan Execute Agent。
+
 流式接口返回 SSE 协议，响应类型为 `text/event-stream`。每个事件使用 `event:` 标识事件类型，`data:` 携带 JSON 数据，常见事件类型：
 
+- `plan`：Plan Execute Agent 规划完成后的有序步骤
 - `trace`：执行轨迹更新
 - `debug`：Agent 内部阶段、工具调用和 grounding 状态
 - `token`：增量文本片段
@@ -127,6 +140,9 @@ SSE 事件示例：
 ```text
 event: trace
 data: "1. Query accepted by React Agent stream API"
+
+event: plan
+data: ["1. Search the knowledge base (knowledge_base_search)", "2. Synthesize answer (answer_synthesis)"]
 
 event: token
 data: "这是增量输出片段"
