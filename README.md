@@ -89,6 +89,7 @@ Plan Execute Agent 流式接口：`POST /api/v1/chat/plan-execute-agent/stream`
 
 - 希望使用 ReAct Agent 模式，由模型自主决定何时调用知识库检索工具
 - 希望使用 Plan Execute Agent 模式，让模型先产出完整计划，再按计划执行
+- 需要让 Agent 通过 `web_search` 工具获取外部或较新的 Web 信息
 - 需要传入历史消息，支持多轮问答上下文
 - 不想替换现有 LangGraph `/query` 流程，而是并行保留两种问答模式
 
@@ -119,6 +120,14 @@ Plan Execute Agent 流式接口：`POST /api/v1/chat/plan-execute-agent/stream`
 - `trace`
 - `confidence_score`
 - `validation`
+
+Agent 模式现在可用的工具包括：
+
+- `knowledge_base_search`：检索已索引的向量知识库内容
+- `collection_overview`：查看当前模型、集合等服务元信息
+- `web_search`：检索外部 Web 信息，默认使用 `mock` provider，返回确定性的标题、URL 和摘要，便于本地开发和测试
+
+`web_search` 不会新增 API schema；调用记录仍进入 `tool_calls`、`trace` 和 `debug`，搜索结果会以 source-compatible 形式进入 `sources`。后续可以在同一工具契约下接入 Tavily、Serper、Brave 或 Bing 等真实 provider。
 
 ### ReAct Agent 与 Plan Execute Agent 的区别
 
@@ -186,7 +195,7 @@ c:/Users/liman/githubProject/ragEnlighten/.venv/Scripts/python.exe -m streamlit 
 
 如果你已经先激活了 `.venv`，也可以直接执行 `streamlit run streamlit_app.py`。
 
-默认会连接 `http://127.0.0.1:8004/api/v1`，也可以在页面侧边栏里改成你当前 FastAPI 服务的地址。
+默认会连接 `http://127.0.0.1:8000/api/v1`，也可以在页面侧边栏里改成你当前 FastAPI 服务的地址。
 
 前端现在会显示：问题分类、路由结果、执行计划、工具调用记录、校验报告、人工复核标记，以及每个检索片段的 hop 和 score。
 

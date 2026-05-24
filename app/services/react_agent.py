@@ -4,17 +4,61 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
-from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.outputs import ChatGenerationChunk, ChatResult
-from langchain_core.tools import tool
-from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI
+try:
+    from langchain_core.documents import Document
+    from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+    from langchain_core.outputs import ChatGenerationChunk, ChatResult
+    from langchain_core.tools import tool
+    from langchain.agents import create_agent
+    from langchain_openai import ChatOpenAI
+except ModuleNotFoundError:
+    @dataclass
+    class Document:  # type: ignore[no-redef]
+        page_content: str
+        metadata: dict[str, Any]
+
+    class BaseMessage:  # type: ignore[no-redef]
+        content: Any = ""
+
+    class AIMessage(BaseMessage):  # type: ignore[no-redef]
+        def __init__(self, content: Any = "", additional_kwargs: dict[str, Any] | None = None):
+            self.content = content
+            self.additional_kwargs = additional_kwargs or {}
+
+    class AIMessageChunk(AIMessage):  # type: ignore[no-redef]
+        pass
+
+    class HumanMessage(BaseMessage):  # type: ignore[no-redef]
+        def __init__(self, content: Any = ""):
+            self.content = content
+
+    class SystemMessage(HumanMessage):  # type: ignore[no-redef]
+        pass
+
+    class ToolMessage(HumanMessage):  # type: ignore[no-redef]
+        tool_call_id: str = ""
+        name: str = ""
+
+    class ChatGenerationChunk:  # type: ignore[no-redef]
+        pass
+
+    class ChatResult:  # type: ignore[no-redef]
+        pass
+
+    class ChatOpenAI:  # type: ignore[no-redef]
+        pass
+
+    def tool(func):  # type: ignore[no-redef]
+        return func
+
+    def create_agent(*args: Any, **kwargs: Any):  # type: ignore[no-redef]
+        raise RuntimeError("LangChain dependencies are required to create the React Agent runtime.")
 
 from app.core.config import settings
-from app.services.indexing import get_parent_chunks_by_ids, get_vectorstore, list_collections
+from app.services.web_search import run_web_search
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -359,28 +403,32 @@ def _build_grounding_context_text(documents: list[Document]) -> str:
 def _build_grounding_status(documents: list[Document], tool_calls: list[dict[str, str]]) -> dict[str, Any]:
     knowledge_search_calls = [call for call in tool_calls if call.get("name") == "knowledge_base_search"]
     metadata_calls = [call for call in tool_calls if call.get("name") == "collection_overview"]
+    web_search_calls = [call for call in tool_calls if call.get("name") == "web_search"]
 
     if documents:
         return {
             "status": "grounded",
             "message": (
                 f"Grounded answer with {len(documents)} retrieved child chunks after "
-                f"{len(knowledge_search_calls)} knowledge-base search call(s)."
+                f"{len(knowledge_search_calls)} knowledge-base search call(s) and "
+                f"{len(web_search_calls)} web search call(s)."
             ),
             "knowledge_search_calls": len(knowledge_search_calls),
             "metadata_calls": len(metadata_calls),
+            "web_search_calls": len(web_search_calls),
             "documents": len(documents),
         }
 
-    if not knowledge_search_calls:
+    if not knowledge_search_calls and not web_search_calls:
         return {
             "status": "no_tool_call",
             "message": (
                 "No retrieved chunks were available because the agent finished without calling "
-                "knowledge_base_search. Any answer produced in this state is not grounded in the vector store."
+                "knowledge_base_search or web_search. Any answer produced in this state is not grounded in tool evidence."
             ),
             "knowledge_search_calls": 0,
             "metadata_calls": len(metadata_calls),
+            "web_search_calls": len(web_search_calls),
             "documents": 0,
         }
 
@@ -392,6 +440,7 @@ def _build_grounding_status(documents: list[Document], tool_calls: list[dict[str
         ),
         "knowledge_search_calls": len(knowledge_search_calls),
         "metadata_calls": len(metadata_calls),
+        "web_search_calls": len(web_search_calls),
         "documents": 0,
     }
 
@@ -483,6 +532,7 @@ def _build_agent_runtime(collection_name: str | None = None):
     def knowledge_base_search(query: str) -> str:
         """Search the indexed knowledge base for evidence relevant to the user's question."""
         nonlocal documents
+        from app.services.indexing import get_parent_chunks_by_ids, get_vectorstore
 
         logger.info(
             "[react_agent.tool.search] collection=%s query=%s",
@@ -547,6 +597,8 @@ def _build_agent_runtime(collection_name: str | None = None):
     @tool
     def collection_overview() -> str:
         """Return internal metadata about the configured models and available collections."""
+        from app.services.indexing import list_collections
+
         logger.info("[react_agent.tool.meta] collection=%s", resolved_collection)
         collections = list_collections()
         summary = ", ".join(f"{item['name']}({item['count']})" for item in collections[:10]) or "none"
@@ -558,20 +610,41 @@ def _build_agent_runtime(collection_name: str | None = None):
             f"Collections: {summary}"
         )
 
+    @tool
+    def web_search(query: str) -> str:
+        """Search the web for external or current information beyond the indexed knowledge base."""
+        nonlocal documents
+
+        logger.info("[react_agent.tool.web_search] query=%s", query[:120])
+        output, web_docs = run_web_search(query)
+        if not web_docs:
+            logger.warning("[react_agent.tool.web_search] no_results output=%s", output[:200])
+            return output
+        merged_documents = _merge_documents(documents, web_docs)
+        documents.clear()
+        documents.extend(merged_documents)
+        logger.info(
+            "[react_agent.tool.web_search] complete results=%s merged_documents=%s",
+            len(web_docs),
+            len(documents),
+        )
+        return output
+
     prompt = (
         "You are a ReAct-style question answering agent for a RAG system. "
         "When the user asks about indexed documents or knowledge-base content, use the knowledge_base_search tool before answering. "
+        "Use web_search for external or current information that is not available in the indexed knowledge base. "
         "Use collection_overview only for system metadata questions such as collection names, model configuration, or service state. "
         "Base your final answer only on tool results. If the tools do not provide enough information, say so directly. "
         "Keep answers concise and grounded."
     )
     agent = create_agent(
         model=_get_llm(),
-        tools=[knowledge_base_search, collection_overview],
+        tools=[knowledge_base_search, collection_overview, web_search],
         system_prompt=prompt,
         name="rag_react_agent",
     )
-    logger.info("[react_agent.runtime] ready tools=%s", 2)
+    logger.info("[react_agent.runtime] ready tools=%s", 3)
     return agent, documents
 
 
@@ -649,7 +722,7 @@ async def run_react_agent_query(
         debug_events,
         "runtime_ready",
         "Agent runtime initialized",
-        tools=["knowledge_base_search", "collection_overview"],
+        tools=["knowledge_base_search", "collection_overview", "web_search"],
     )
 
     model_input = {"messages": _build_messages(question, history)}
@@ -772,6 +845,7 @@ async def run_react_agent_query(
         status=grounding_status["status"],
         knowledge_search_calls=grounding_status["knowledge_search_calls"],
         metadata_calls=grounding_status["metadata_calls"],
+        web_search_calls=grounding_status["web_search_calls"],
         documents=grounding_status["documents"],
     )
     if answer != raw_answer:
@@ -856,7 +930,7 @@ async def stream_react_agent_query(
         debug_events,
         "runtime_ready",
         "Agent runtime initialized",
-        tools=["knowledge_base_search", "collection_overview"],
+        tools=["knowledge_base_search", "collection_overview", "web_search"],
     )
     yield {"type": "debug", "data": debug_events[-1]}
     pending_calls: dict[str, dict[str, str]] = {}
@@ -1026,6 +1100,7 @@ async def stream_react_agent_query(
         status=grounding_status["status"],
         knowledge_search_calls=grounding_status["knowledge_search_calls"],
         metadata_calls=grounding_status["metadata_calls"],
+        web_search_calls=grounding_status["web_search_calls"],
         documents=grounding_status["documents"],
     )
     yield {"type": "debug", "data": debug_events[-1]}

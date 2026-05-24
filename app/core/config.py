@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     answer_validation_min_confidence: float = 0.65
     langgraph_recursion_limit: int = 64
 
+    # Web search tool
+    web_search_enabled: bool = True
+    web_search_provider: str = "mock"
+    web_search_top_k: int = 3
+
     # Content preview lengths
     grade_context_chars: int = 500   # chars of each chunk sent to the relevance grader
     rewrite_context_chars: int = 800
