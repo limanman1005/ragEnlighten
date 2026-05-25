@@ -123,9 +123,39 @@ Plan Execute Agent 流式接口：`POST /api/v1/chat/plan-execute-agent/stream`
 
 Agent 模式现在可用的工具包括：
 
-- `knowledge_base_search`：检索已索引的向量知识库内容
+- `knowledge_base_search`：检索已索引的向量知识库内容，支持可选 `source_types`（如 `pdf`、`docx`、`txt`、`md`）和 `top_k` 过滤
 - `collection_overview`：查看当前模型、集合等服务元信息
 - `web_search`：检索外部 Web 信息，默认使用 `mock` provider，返回确定性的标题、URL 和摘要，便于本地开发和测试；也可以配置 `tavily` provider 调用 Tavily Search API 获取真实 Web 结果
+
+这些工具现在通过共享 Agent 工具服务层执行，并返回统一结构化结果（`status`、`content`、`sources`、`error`）。本地 LangChain 工具会把 `sources` 继续映射到 `QueryResponse.sources`，供 grounding 校验和前端展示使用。
+
+### Agent MCP 工具模式（方案 C）
+
+默认情况下，ReAct Agent 仍使用进程内本地工具（`MCP_ENABLED=false`）。如果希望把同一套工具暴露为 MCP server，并让 Agent 作为 MCP client 调用，可以启用 MCP 双路径模式：
+
+```env
+MCP_ENABLED=true
+MCP_TOOLS_URL=http://127.0.0.1:8001/mcp
+MCP_TOOL_NAME_PREFIX=true
+MCP_FALLBACK_TO_LOCAL=true
+MCP_SERVER_HOST=127.0.0.1
+MCP_SERVER_PORT=8001
+AGENT_TOOL_TIMEOUT_SECONDS=15
+AGENT_TOOL_DEFAULT_MAX_RETRIES=1
+```
+
+启动 MCP tool server：
+
+```bash
+python -m app.mcp.server
+```
+
+行为说明：
+
+- `MCP_ENABLED=false`：ReAct Agent 使用本地 `@tool` 包装器，行为与现有开发模式兼容。
+- `MCP_ENABLED=true`：ReAct Agent 通过 MCP 协议加载 `knowledge_base_search`、`collection_overview`、`web_search`。
+- MCP 加载失败且 `MCP_FALLBACK_TO_LOCAL=true` 时，会自动回退到本地工具，并在 `debug_events` 中记录 `mcp_load_error`。
+- MCP 工具返回的结构化 `sources` 会被 React Agent 重新合并进 grounding 上下文，保证 `sources` 和 validation 不丢失。
 
 `web_search` 不会新增 API schema；调用记录仍进入 `tool_calls`、`trace` 和 `debug`，搜索结果会以 source-compatible 形式进入 `sources`。
 
@@ -276,6 +306,11 @@ curl -X POST http://localhost:8000/api/v1/query \
 | `MIN_RELEVANT_CHUNKS_TO_ANSWER` | `2` | 至少保留多少相关 chunk 才直接进入生成 |
 | `MAX_VALIDATION_RETRIES` | `1` | 校验不通过时最多追加多少次自反思重试 |
 | `ANSWER_VALIDATION_MIN_CONFIDENCE` | `0.65` | 答案校验阶段的最低通过置信度 |
+| `MCP_ENABLED` | `false` | 是否让 ReAct Agent 通过 MCP client 加载工具 |
+| `MCP_TOOLS_URL` | `http://127.0.0.1:8001/mcp` | Agent MCP client 连接地址 |
+| `MCP_FALLBACK_TO_LOCAL` | `true` | MCP 加载失败时是否回退到本地工具 |
+| `AGENT_TOOL_TIMEOUT_SECONDS` | `15` | 共享 Agent 工具执行超时预算（秒） |
+| `AGENT_TOOL_DEFAULT_MAX_RETRIES` | `1` | 共享 Agent 工具默认重试次数 |
 | `APP_HOST` | `0.0.0.0` | 服务监听地址 |
 | `APP_PORT` | `8000` | 服务监听端口 |
 | `APP_RELOAD` | `false` | 是否开启热重载（开发模式） |

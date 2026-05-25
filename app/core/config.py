@@ -58,6 +58,18 @@ class Settings(BaseSettings):
     web_search_tavily_include_raw_content: bool = False
     web_search_tavily_max_raw_content_chars: int = 1000
 
+    # Shared Agent tool execution
+    agent_tool_timeout_seconds: float = 15.0
+    agent_tool_default_max_retries: int = 1
+
+    # MCP tool server / client
+    mcp_enabled: bool = False
+    mcp_tools_url: str = "http://127.0.0.1:8001/mcp"
+    mcp_tool_name_prefix: bool = True
+    mcp_fallback_to_local: bool = True
+    mcp_server_host: str = "127.0.0.1"
+    mcp_server_port: int = 8001
+
     # Content preview lengths
     grade_context_chars: int = 500   # chars of each chunk sent to the relevance grader
     rewrite_context_chars: int = 800
