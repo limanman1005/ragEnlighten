@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     web_search_enabled: bool = True
     web_search_provider: str = "mock"
     web_search_top_k: int = 3
+    web_search_api_key: str = ""
+    web_search_timeout_seconds: float = 10.0
+    web_search_tavily_search_depth: str = "basic"
+    web_search_tavily_include_raw_content: bool = False
+    web_search_tavily_max_raw_content_chars: int = 1000
 
     # Content preview lengths
     grade_context_chars: int = 500   # chars of each chunk sent to the relevance grader

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from app.core.config import settings
 
@@ -52,6 +55,108 @@ class MockWebSearchProvider:
         ]
 
 
+Transport = Callable[[str, dict[str, object], dict[str, str], float], dict[str, Any]]
+
+
+class TavilyWebSearchProvider:
+    """Tavily Search API provider for live web evidence."""
+
+    endpoint = "https://api.tavily.com/search"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        timeout_seconds: float | None = None,
+        search_depth: str | None = None,
+        include_raw_content: bool | None = None,
+        max_raw_content_chars: int | None = None,
+        transport: Transport | None = None,
+    ) -> None:
+        self.api_key = api_key if api_key is not None else settings.web_search_api_key
+        self.timeout_seconds = (
+            timeout_seconds if timeout_seconds is not None else settings.web_search_timeout_seconds
+        )
+        self.search_depth = search_depth or settings.web_search_tavily_search_depth
+        self.include_raw_content = (
+            include_raw_content
+            if include_raw_content is not None
+            else settings.web_search_tavily_include_raw_content
+        )
+        self.max_raw_content_chars = (
+            max_raw_content_chars
+            if max_raw_content_chars is not None
+            else settings.web_search_tavily_max_raw_content_chars
+        )
+        self.transport = transport or _post_json
+
+    def search(self, query: str, top_k: int) -> list[WebSearchResult]:
+        if not self.api_key.strip():
+            raise ValueError("WEB_SEARCH_API_KEY is required when WEB_SEARCH_PROVIDER=tavily")
+
+        normalized_query = query.strip()
+        if not normalized_query:
+            return []
+
+        payload: dict[str, object] = {
+            "query": normalized_query,
+            "max_results": max(0, top_k),
+            "search_depth": self.search_depth,
+            "include_raw_content": self.include_raw_content,
+        }
+        response = self.transport(
+            self.endpoint,
+            payload,
+            {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            float(self.timeout_seconds),
+        )
+        raw_results = response.get("results")
+        if not isinstance(raw_results, list):
+            raise ValueError("Tavily response missing results list")
+
+        results: list[WebSearchResult] = []
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            snippet = str(item.get("content") or "").strip()
+            if not snippet:
+                snippet = str(item.get("raw_content") or "").strip()[: max(0, self.max_raw_content_chars)]
+            if title and url and snippet:
+                results.append(WebSearchResult(title=title, url=url, snippet=snippet))
+        return results
+
+
+def _post_json(
+    url: str,
+    payload: dict[str, object],
+    headers: dict[str, str],
+    timeout: float,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Tavily HTTP error {exc.code}: {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Tavily request failed: {exc.reason}") from exc
+
+    parsed = json.loads(body)
+    if not isinstance(parsed, dict):
+        raise ValueError("Tavily response must be a JSON object")
+    return parsed
+
+
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug or "query"
@@ -61,6 +166,8 @@ def get_web_search_provider(provider_name: str | None = None) -> WebSearchProvid
     provider = (provider_name or settings.web_search_provider).strip().lower()
     if provider == "mock":
         return MockWebSearchProvider()
+    if provider == "tavily":
+        return TavilyWebSearchProvider()
     raise ValueError(f"Unsupported web search provider: {provider}")
 
 
