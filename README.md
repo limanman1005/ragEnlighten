@@ -125,9 +125,24 @@ Agent 模式现在可用的工具包括：
 
 - `knowledge_base_search`：检索已索引的向量知识库内容
 - `collection_overview`：查看当前模型、集合等服务元信息
-- `web_search`：检索外部 Web 信息，默认使用 `mock` provider，返回确定性的标题、URL 和摘要，便于本地开发和测试
+- `web_search`：检索外部 Web 信息，默认使用 `mock` provider，返回确定性的标题、URL 和摘要，便于本地开发和测试；也可以配置 `tavily` provider 调用 Tavily Search API 获取真实 Web 结果
 
-`web_search` 不会新增 API schema；调用记录仍进入 `tool_calls`、`trace` 和 `debug`，搜索结果会以 source-compatible 形式进入 `sources`。后续可以在同一工具契约下接入 Tavily、Serper、Brave 或 Bing 等真实 provider。
+`web_search` 不会新增 API schema；调用记录仍进入 `tool_calls`、`trace` 和 `debug`，搜索结果会以 source-compatible 形式进入 `sources`。
+
+默认配置使用 `mock` provider，不需要外部凭据。要启用 Tavily：
+
+```env
+WEB_SEARCH_ENABLED=true
+WEB_SEARCH_PROVIDER=tavily
+WEB_SEARCH_API_KEY=tvly-...
+WEB_SEARCH_TOP_K=3
+WEB_SEARCH_TIMEOUT_SECONDS=10
+WEB_SEARCH_TAVILY_SEARCH_DEPTH=basic
+WEB_SEARCH_TAVILY_INCLUDE_RAW_CONTENT=false
+WEB_SEARCH_TAVILY_MAX_RAW_CONTENT_CHARS=1000
+```
+
+Tavily provider 会把 Tavily `results` 映射为现有的 `title`、`url`、`snippet` 结构。缺少 API key、HTTP 错误或无可用结果时，错误会记录为失败的 `web_search` 工具输出，不会改变 Agent endpoint 的响应 schema。
 
 ### ReAct Agent 与 Plan Execute Agent 的区别
 
