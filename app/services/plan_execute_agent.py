@@ -11,10 +11,18 @@ import inspect
 import json
 import logging
 import re
+import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable
 
 from app.core.config import settings
+from app.core.tracing import (
+    PLAN_EXECUTE_QUERY_ENDPOINT,
+    PLAN_EXECUTE_STREAM_ENDPOINT,
+    build_run_config,
+    is_tracing_enabled,
+)
 from app.services.web_search import run_web_search
 logger = logging.getLogger("uvicorn.error")
 
@@ -190,13 +198,29 @@ def _format_history(history: list[dict[str, Any]] | None) -> str:
     return "\n".join(parts) or "(none)"
 
 
-def _create_plan(question: str, history: list[dict[str, Any]] | None = None) -> list[PlanStep]:
+def _create_plan(
+    question: str,
+    history: list[dict[str, Any]] | None = None,
+    *,
+    collection_name: str | None = None,
+    streaming: bool = False,
+) -> list[PlanStep]:
     from langchain_core.output_parsers import StrOutputParser
 
     prompt = _build_planning_prompt()
+    run_config = build_run_config(
+        "plan-execute-planning",
+        route="plan_execute_agent",
+        endpoint=PLAN_EXECUTE_STREAM_ENDPOINT if streaming else PLAN_EXECUTE_QUERY_ENDPOINT,
+        streaming=streaming,
+        collection_name=collection_name,
+        history_count=len(history or []),
+        phase="planning",
+    )
     try:
         raw = (prompt | _get_llm() | StrOutputParser()).invoke(
-            {"question": question, "history": _format_history(history)}
+            {"question": question, "history": _format_history(history)},
+            config=run_config,
         )
         return _parse_plan_steps(raw, question)
     except Exception:
@@ -322,6 +346,23 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _plan_execute_step_trace(step: PlanStep):
+    if not is_tracing_enabled():
+        return nullcontext()
+    from langsmith.run_helpers import trace
+
+    return trace(
+        name=f"plan-execute-step-{step.step_id}",
+        run_type="tool",
+        inputs={"tool": step.tool, "query": step.query},
+        metadata={
+            "phase": "execution",
+            "step_id": step.step_id,
+            "tool_name": step.tool,
+        },
+    )
+
+
 async def _execute_plan_steps(
     steps: list[PlanStep],
     *,
@@ -335,46 +376,83 @@ async def _execute_plan_steps(
     trace: list[str] = []
     debug_events: list[dict[str, Any]] = []
 
-    for step in steps:
-        if step.tool == "answer_synthesis":
-            trace.append(f"{len(trace) + 1}. Plan step {step.step_id}: ready for answer synthesis")
-            continue
+    execution_ctx = nullcontext()
+    if is_tracing_enabled():
+        from langsmith.run_helpers import trace
 
-        trace.append(f"{len(trace) + 1}. Executing plan step {step.step_id}: {step.purpose}")
-        _append_debug_event(
-            debug_events,
-            "execution",
-            f"Executing plan step {step.step_id}",
-            tool=step.tool,
-            query=step.query,
+        execution_ctx = trace(
+            name="plan-execute-execution",
+            run_type="chain",
+            metadata={"phase": "execution"},
         )
-        if step.tool == "knowledge_base_search":
-            output, docs = await _maybe_await(search(step.query))
-            documents = _merge_documents(documents, docs)
-        elif step.tool == "web_search":
-            try:
-                output, docs = await _maybe_await((web_search or run_web_search)(step.query))
-            except Exception as exc:
-                output = f"Web search failed: {exc}"
-                docs = []
-            documents = _merge_documents(documents, docs)
-        elif step.tool == "collection_overview":
-            output = await _maybe_await(overview())
-        else:
-            continue
 
-        output_text = str(output)
-        if step.tool != "web_search" or docs:
-            tool_context.append(output_text)
-        tool_calls.append(
-            {
-                "name": step.tool,
-                "status": "failed" if step.tool == "web_search" and output_text.startswith("Web search failed:") else "success",
-                "input_summary": step.query[:120],
-                "output_summary": output_text[:1600],
-            }
-        )
-        trace.append(f"{len(trace) + 1}. Tool {step.tool} returned a result")
+    with execution_ctx:
+        for step in steps:
+            if step.tool == "answer_synthesis":
+                trace.append(f"{len(trace) + 1}. Plan step {step.step_id}: ready for answer synthesis")
+                continue
+
+            trace.append(f"{len(trace) + 1}. Executing plan step {step.step_id}: {step.purpose}")
+            _append_debug_event(
+                debug_events,
+                "execution",
+                f"Executing plan step {step.step_id}",
+                tool=step.tool,
+                query=step.query,
+            )
+            started = time.perf_counter()
+            step_status = "success"
+            docs_found_count = 0
+            output_text = ""
+
+            with _plan_execute_step_trace(step) as step_run:
+                try:
+                    if step.tool == "knowledge_base_search":
+                        output, docs = await _maybe_await(search(step.query))
+                        documents = _merge_documents(documents, docs)
+                        docs_found_count = len(docs)
+                    elif step.tool == "web_search":
+                        try:
+                            output, docs = await _maybe_await((web_search or run_web_search)(step.query))
+                        except Exception as exc:
+                            output = f"Web search failed: {exc}"
+                            docs = []
+                            step_status = "failed"
+                        documents = _merge_documents(documents, docs)
+                        docs_found_count = len(docs)
+                    elif step.tool == "collection_overview":
+                        output = await _maybe_await(overview())
+                    else:
+                        continue
+
+                    output_text = str(output)
+                    if step.tool == "web_search" and output_text.startswith("Web search failed:"):
+                        step_status = "failed"
+                except Exception:
+                    step_status = "failed"
+                    raise
+                finally:
+                    if step_run is not None:
+                        step_run.end(
+                            outputs={
+                                "step_status": step_status,
+                                "step_latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                                "docs_found_count": docs_found_count,
+                                "tool_name": step.tool,
+                            }
+                        )
+
+            if step.tool != "web_search" or docs_found_count:
+                tool_context.append(output_text)
+            tool_calls.append(
+                {
+                    "name": step.tool,
+                    "status": step_status,
+                    "input_summary": step.query[:120],
+                    "output_summary": output_text[:1600],
+                }
+            )
+            trace.append(f"{len(trace) + 1}. Tool {step.tool} returned a result")
 
     return PlanExecutionResult(
         documents=documents,
@@ -385,11 +463,28 @@ async def _execute_plan_steps(
     )
 
 
-def _synthesize_answer(question: str, plan: list[PlanStep], execution: PlanExecutionResult) -> str:
+def _synthesize_answer(
+    question: str,
+    plan: list[PlanStep],
+    execution: PlanExecutionResult,
+    *,
+    collection_name: str | None = None,
+    history_count: int = 0,
+    streaming: bool = False,
+) -> str:
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import ChatPromptTemplate
 
     context = "\n\n---\n\n".join(execution.tool_context) or "(no tool output available)"
+    run_config = build_run_config(
+        "plan-execute-synthesis",
+        route="plan_execute_agent",
+        endpoint=PLAN_EXECUTE_STREAM_ENDPOINT if streaming else PLAN_EXECUTE_QUERY_ENDPOINT,
+        streaming=streaming,
+        collection_name=collection_name,
+        history_count=history_count,
+        phase="synthesis",
+    )
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -411,7 +506,8 @@ def _synthesize_answer(question: str, plan: list[PlanStep], execution: PlanExecu
             "question": question,
             "plan": "\n".join(_plan_to_strings(plan)),
             "context": context,
-        }
+        },
+        config=run_config,
     )
 
 
@@ -470,15 +566,28 @@ def _build_result(
     }
 
 
-async def run_plan_execute_agent_query(
+async def _run_plan_execute_agent_query_body(
     question: str,
-    collection_name: str | None = None,
-    history: list[dict[str, str]] | None = None,
+    collection_name: str | None,
+    history: list[dict[str, str]] | None,
+    *,
+    streaming: bool,
 ) -> dict[str, Any]:
-    trace = ["1. Query accepted by Plan-Execute Agent API", "2. Planning phase started"]
+    history_count = len(history or [])
+    trace = [
+        "1. Query accepted by Plan-Execute Agent API"
+        if not streaming
+        else "1. Query accepted by Plan-Execute Agent stream API",
+        "2. Planning phase started",
+    ]
     debug_events: list[dict[str, Any]] = []
     _append_debug_event(debug_events, "planning", "Planning phase started")
-    plan = _create_plan(question, history)
+    plan = _create_plan(
+        question,
+        history,
+        collection_name=collection_name,
+        streaming=streaming,
+    )
     trace.append(f"3. Planning complete: {len(plan)} steps")
     _append_debug_event(debug_events, "plan", "Planning phase complete", plan=_plan_to_strings(plan))
 
@@ -490,7 +599,14 @@ async def run_plan_execute_agent_query(
     )
     execution.trace = [*trace, *execution.trace]
     execution.debug_events = [*debug_events, *execution.debug_events]
-    raw_answer = _synthesize_answer(question, plan, execution)
+    raw_answer = _synthesize_answer(
+        question,
+        plan,
+        execution,
+        collection_name=collection_name,
+        history_count=history_count,
+        streaming=streaming,
+    )
     answer, needs_human_review, human_review_reason = _apply_grounding_guard(
         raw_answer,
         execution,
@@ -506,15 +622,57 @@ async def run_plan_execute_agent_query(
     )
 
 
-async def stream_plan_execute_agent_query(
+async def run_plan_execute_agent_query(
     question: str,
     collection_name: str | None = None,
     history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    if not is_tracing_enabled():
+        return await _run_plan_execute_agent_query_body(
+            question,
+            collection_name,
+            history,
+            streaming=False,
+        )
+
+    from langsmith.run_helpers import trace
+
+    history_count = len(history or [])
+    with trace(
+        name="plan-execute-query",
+        run_type="chain",
+        metadata=build_run_config(
+            "plan-execute-query",
+            route="plan_execute_agent",
+            endpoint=PLAN_EXECUTE_QUERY_ENDPOINT,
+            streaming=False,
+            collection_name=collection_name,
+            history_count=history_count,
+        ).get("metadata", {}),
+    ):
+        return await _run_plan_execute_agent_query_body(
+            question,
+            collection_name,
+            history,
+            streaming=False,
+        )
+
+
+async def _stream_plan_execute_agent_query_body(
+    question: str,
+    collection_name: str | None,
+    history: list[dict[str, str]] | None,
 ) -> AsyncIterator[dict[str, Any]]:
+    history_count = len(history or [])
     yield {"type": "debug", "data": {"phase": "planning", "message": "Planning phase started"}}
     yield {"type": "trace", "data": "1. Query accepted by Plan-Execute Agent stream API"}
     yield {"type": "trace", "data": "2. Planning phase started"}
-    plan = _create_plan(question, history)
+    plan = _create_plan(
+        question,
+        history,
+        collection_name=collection_name,
+        streaming=True,
+    )
     plan_strings = _plan_to_strings(plan)
     yield {"type": "plan", "data": plan_strings}
     yield {"type": "debug", "data": {"phase": "plan", "message": "Planning phase complete", "details": {"plan": plan_strings}}}
@@ -530,7 +688,14 @@ async def stream_plan_execute_agent_query(
     for event in execution.debug_events:
         yield {"type": "debug", "data": event}
 
-    raw_answer = _synthesize_answer(question, plan, execution)
+    raw_answer = _synthesize_answer(
+        question,
+        plan,
+        execution,
+        collection_name=collection_name,
+        history_count=history_count,
+        streaming=True,
+    )
     answer, needs_human_review, human_review_reason = _apply_grounding_guard(
         raw_answer,
         execution,
@@ -547,3 +712,32 @@ async def stream_plan_execute_agent_query(
         human_review_reason,
     )
     yield {"type": "final", "data": result}
+
+
+async def stream_plan_execute_agent_query(
+    question: str,
+    collection_name: str | None = None,
+    history: list[dict[str, str]] | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    if not is_tracing_enabled():
+        async for event in _stream_plan_execute_agent_query_body(question, collection_name, history):
+            yield event
+        return
+
+    from langsmith.run_helpers import trace
+
+    history_count = len(history or [])
+    with trace(
+        name="plan-execute-stream",
+        run_type="chain",
+        metadata=build_run_config(
+            "plan-execute-stream",
+            route="plan_execute_agent",
+            endpoint=PLAN_EXECUTE_STREAM_ENDPOINT,
+            streaming=True,
+            collection_name=collection_name,
+            history_count=history_count,
+        ).get("metadata", {}),
+    ):
+        async for event in _stream_plan_execute_agent_query_body(question, collection_name, history):
+            yield event

@@ -58,6 +58,11 @@ except ModuleNotFoundError:
         raise RuntimeError("LangChain dependencies are required to create the React Agent runtime.")
 
 from app.core.config import settings
+from app.core.tracing import (
+    REACT_AGENT_QUERY_ENDPOINT,
+    REACT_AGENT_STREAM_ENDPOINT,
+    build_run_config,
+)
 from app.services.agent_tools import (
     CollectionOverviewRequest,
     KnowledgeBaseSearchRequest,
@@ -710,7 +715,15 @@ async def run_react_agent_query(
         "Starting agent reasoning loop",
         input_messages=len(model_input["messages"]),
     )
-    result = await agent.ainvoke(model_input)
+    run_config = build_run_config(
+        "react-agent-query",
+        route="react_agent",
+        endpoint=REACT_AGENT_QUERY_ENDPOINT,
+        streaming=False,
+        collection_name=collection_name,
+        history_count=len(history or []),
+    )
+    result = await agent.ainvoke(model_input, config=run_config)
     messages = result.get("messages", [])
     logger.info("[react_agent.query] agent_returned_messages=%s", len(messages))
     _append_debug_event(
@@ -935,9 +948,18 @@ async def stream_react_agent_query(
     )
     yield {"type": "debug", "data": debug_events[-1]}
 
+    stream_config = build_run_config(
+        "react-agent-stream",
+        route="react_agent",
+        endpoint=REACT_AGENT_STREAM_ENDPOINT,
+        streaming=True,
+        collection_name=collection_name,
+        history_count=len(history or []),
+    )
     async for event in agent.astream_events(
         {"messages": input_messages},
         version="v2",
+        config=stream_config,
     ):
         event_name = event.get("event", "")
         data = event.get("data", {}) or {}

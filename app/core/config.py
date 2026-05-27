@@ -7,6 +7,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     # LLM
@@ -74,6 +75,24 @@ class Settings(BaseSettings):
     grade_context_chars: int = 500   # chars of each chunk sent to the relevance grader
     rewrite_context_chars: int = 800
     source_preview_chars: int = 300  # chars shown per source in query responses
+
+    # LangSmith tracing (LangChain-compatible env vars)
+    langsmith_tracing_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("LANGSMITH_TRACING_ENABLED", "LANGCHAIN_TRACING_V2"),
+    )
+    langsmith_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY"),
+    )
+    langsmith_project: str = Field(
+        default="ragEnlighten",
+        validation_alias=AliasChoices("LANGSMITH_PROJECT", "LANGCHAIN_PROJECT"),
+    )
+    langsmith_endpoint: str = Field(
+        default="",
+        validation_alias=AliasChoices("LANGSMITH_ENDPOINT", "LANGCHAIN_ENDPOINT"),
+    )
 
     # FastAPI
     app_host: str = "0.0.0.0"

@@ -180,6 +180,35 @@ Tavily provider 会把 Tavily `results` 映射为现有的 `title`、`url`、`sn
 - Plan Execute Agent 是“先规划再执行”：模型先输出完整 `plan`，后续执行阶段只按这个计划顺序调用工具并汇总答案，不再让模型临时追加工具决策。
 - 如果需要更强适应性，使用 ReAct Agent；如果需要更容易审计、展示和复盘的执行过程，使用 Plan Execute Agent。
 
+### LangSmith 可观测（React / Plan-Execute）
+
+可为 React Agent 与 Plan-Execute Agent 启用 [LangSmith](https://smith.langchain.com/) tracing，在 UI 中查看 LLM 调用、工具链路与请求元数据。默认关闭，不影响现有 API 行为。
+
+在 `.env` 中配置：
+
+```env
+LANGSMITH_TRACING_ENABLED=true
+LANGSMITH_API_KEY=lsv2_...
+LANGSMITH_PROJECT=ragEnlighten
+# LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+```
+
+启动服务后调用 `/api/v1/chat/react-agent`、`/api/v1/chat/react-agent/stream`、`/api/v1/chat/plan-execute-agent` 或 `/api/v1/chat/plan-execute-agent/stream`，trace 会写入上述 project。
+
+在 LangSmith 中可按 metadata 筛选：
+
+| 字段 | 含义 |
+|------|------|
+| `route` | `react_agent` 或 `plan_execute_agent` |
+| `endpoint` | 具体 API 路径 |
+| `streaming` | `true` / `false` |
+| `collection_name` | 使用的向量集合 |
+| `phase` | Plan-Execute：`planning` / `execution` / `synthesis` |
+
+常见 run 名称：`react-agent-query`、`react-agent-stream`、`plan-execute-query`、`plan-execute-stream`、`plan-execute-planning`、`plan-execute-execution`、`plan-execute-synthesis`，以及 `plan-execute-step-{id}` 逐步执行子 run。
+
+未启用 tracing 时，Agent 响应与 SSE 事件格式与启用前一致。
+
 流式接口返回 SSE 协议，响应类型为 `text/event-stream`。每个事件使用 `event:` 标识事件类型，`data:` 携带 JSON 数据，常见事件类型：
 
 - `plan`：Plan Execute Agent 规划完成后的有序步骤
