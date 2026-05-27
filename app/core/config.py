@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     # LangSmith tracing (LangChain-compatible env vars)
     langsmith_tracing_enabled: bool = Field(
         default=False,
-        validation_alias=AliasChoices("LANGSMITH_TRACING_ENABLED", "LANGCHAIN_TRACING_V2"),
+        validation_alias=AliasChoices("LANGSMITH_TRACING_ENABLED"),
     )
     langsmith_api_key: str = Field(
         default="",

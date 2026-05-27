@@ -61,6 +61,9 @@ from app.core.config import settings
 from app.core.tracing import (
     REACT_AGENT_QUERY_ENDPOINT,
     REACT_AGENT_STREAM_ENDPOINT,
+    AgentTraceContext,
+    agent_request_tracing,
+    build_agent_trace_context,
     build_run_config,
 )
 from app.services.agent_tools import (
@@ -682,6 +685,29 @@ async def run_react_agent_query(
     history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Answer a question with a ReAct-style agent loop backed by knowledge-base tools."""
+    trace_ctx = build_agent_trace_context(
+        route="react_agent",
+        endpoint=REACT_AGENT_QUERY_ENDPOINT,
+        streaming=False,
+        collection_name=collection_name,
+        history_count=len(history or []),
+    )
+    with agent_request_tracing("react-agent-query", trace_ctx):
+        return await _run_react_agent_query_body(
+            question,
+            collection_name,
+            history,
+            trace_ctx=trace_ctx,
+        )
+
+
+async def _run_react_agent_query_body(
+    question: str,
+    collection_name: str | None,
+    history: list[dict[str, str]] | None,
+    *,
+    trace_ctx: AgentTraceContext,
+) -> dict[str, Any]:
     trace = ["1. Query accepted by React Agent API"]
     debug_events: list[dict[str, Any]] = []
     _append_debug_event(
@@ -717,11 +743,7 @@ async def run_react_agent_query(
     )
     run_config = build_run_config(
         "react-agent-query",
-        route="react_agent",
-        endpoint=REACT_AGENT_QUERY_ENDPOINT,
-        streaming=False,
-        collection_name=collection_name,
-        history_count=len(history or []),
+        trace_context=trace_ctx,
     )
     result = await agent.ainvoke(model_input, config=run_config)
     messages = result.get("messages", [])
@@ -902,6 +924,30 @@ async def stream_react_agent_query(
     history: list[dict[str, str]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream React Agent events and emit a final structured payload."""
+    trace_ctx = build_agent_trace_context(
+        route="react_agent",
+        endpoint=REACT_AGENT_STREAM_ENDPOINT,
+        streaming=True,
+        collection_name=collection_name,
+        history_count=len(history or []),
+    )
+    with agent_request_tracing("react-agent-stream", trace_ctx):
+        async for event in _stream_react_agent_query_body(
+            question,
+            collection_name,
+            history,
+            trace_ctx=trace_ctx,
+        ):
+            yield event
+
+
+async def _stream_react_agent_query_body(
+    question: str,
+    collection_name: str | None,
+    history: list[dict[str, str]] | None,
+    *,
+    trace_ctx: AgentTraceContext,
+) -> AsyncIterator[dict[str, Any]]:
     trace = ["1. Query accepted by React Agent stream API"]
     debug_events: list[dict[str, Any]] = []
     _append_debug_event(
@@ -950,11 +996,7 @@ async def stream_react_agent_query(
 
     stream_config = build_run_config(
         "react-agent-stream",
-        route="react_agent",
-        endpoint=REACT_AGENT_STREAM_ENDPOINT,
-        streaming=True,
-        collection_name=collection_name,
-        history_count=len(history or []),
+        trace_context=trace_ctx,
     )
     async for event in agent.astream_events(
         {"messages": input_messages},

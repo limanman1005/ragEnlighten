@@ -18,10 +18,14 @@ from typing import Any, AsyncIterator, Callable
 
 from app.core.config import settings
 from app.core.tracing import (
+    PLAN_EXECUTE_EXECUTABLE_TOOLS,
     PLAN_EXECUTE_QUERY_ENDPOINT,
     PLAN_EXECUTE_STREAM_ENDPOINT,
+    AgentTraceContext,
+    agent_child_trace,
+    agent_request_tracing,
+    build_agent_trace_context,
     build_run_config,
-    is_tracing_enabled,
 )
 from app.services.web_search import run_web_search
 logger = logging.getLogger("uvicorn.error")
@@ -202,19 +206,14 @@ def _create_plan(
     question: str,
     history: list[dict[str, Any]] | None = None,
     *,
-    collection_name: str | None = None,
-    streaming: bool = False,
+    trace_ctx: AgentTraceContext | None = None,
 ) -> list[PlanStep]:
     from langchain_core.output_parsers import StrOutputParser
 
     prompt = _build_planning_prompt()
     run_config = build_run_config(
         "plan-execute-planning",
-        route="plan_execute_agent",
-        endpoint=PLAN_EXECUTE_STREAM_ENDPOINT if streaming else PLAN_EXECUTE_QUERY_ENDPOINT,
-        streaming=streaming,
-        collection_name=collection_name,
-        history_count=len(history or []),
+        trace_context=trace_ctx,
         phase="planning",
     )
     try:
@@ -346,26 +345,10 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _plan_execute_step_trace(step: PlanStep):
-    if not is_tracing_enabled():
-        return nullcontext()
-    from langsmith.run_helpers import trace
-
-    return trace(
-        name=f"plan-execute-step-{step.step_id}",
-        run_type="tool",
-        inputs={"tool": step.tool, "query": step.query},
-        metadata={
-            "phase": "execution",
-            "step_id": step.step_id,
-            "tool_name": step.tool,
-        },
-    )
-
-
 async def _execute_plan_steps(
     steps: list[PlanStep],
     *,
+    trace_ctx: AgentTraceContext | None = None,
     search: Callable[[str], Any],
     overview: Callable[[], Any],
     web_search: Callable[[str], Any] | None = None,
@@ -376,20 +359,34 @@ async def _execute_plan_steps(
     trace: list[str] = []
     debug_events: list[dict[str, Any]] = []
 
-    execution_ctx = nullcontext()
-    if is_tracing_enabled():
-        from langsmith.run_helpers import trace
-
-        execution_ctx = trace(
-            name="plan-execute-execution",
-            run_type="chain",
-            metadata={"phase": "execution"},
+    execution_ctx = (
+        agent_child_trace(
+            "plan-execute-execution",
+            trace_ctx,
+            phase="execution",
         )
+        if trace_ctx is not None
+        else nullcontext()
+    )
 
     with execution_ctx:
         for step in steps:
             if step.tool == "answer_synthesis":
                 trace.append(f"{len(trace) + 1}. Plan step {step.step_id}: ready for answer synthesis")
+                continue
+
+            if step.tool not in PLAN_EXECUTE_EXECUTABLE_TOOLS:
+                trace.append(
+                    f"{len(trace) + 1}. Skipped plan step {step.step_id}: unsupported tool {step.tool}"
+                )
+                _append_debug_event(
+                    debug_events,
+                    "execution",
+                    f"Skipped unsupported plan step {step.step_id}",
+                    tool=step.tool,
+                    query=step.query,
+                    status="skipped",
+                )
                 continue
 
             trace.append(f"{len(trace) + 1}. Executing plan step {step.step_id}: {step.purpose}")
@@ -405,7 +402,19 @@ async def _execute_plan_steps(
             docs_found_count = 0
             output_text = ""
 
-            with _plan_execute_step_trace(step) as step_run:
+            step_ctx = (
+                agent_child_trace(
+                    f"plan-execute-step-{step.step_id}",
+                    trace_ctx,
+                    run_type="tool",
+                    phase="execution",
+                    inputs={"tool": step.tool, "query": step.query},
+                    extra_metadata={"step_id": step.step_id, "tool_name": step.tool},
+                )
+                if trace_ctx is not None
+                else nullcontext()
+            )
+            with step_ctx as step_run:
                 try:
                     if step.tool == "knowledge_base_search":
                         output, docs = await _maybe_await(search(step.query))
@@ -468,9 +477,7 @@ def _synthesize_answer(
     plan: list[PlanStep],
     execution: PlanExecutionResult,
     *,
-    collection_name: str | None = None,
-    history_count: int = 0,
-    streaming: bool = False,
+    trace_ctx: AgentTraceContext | None = None,
 ) -> str:
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import ChatPromptTemplate
@@ -478,11 +485,7 @@ def _synthesize_answer(
     context = "\n\n---\n\n".join(execution.tool_context) or "(no tool output available)"
     run_config = build_run_config(
         "plan-execute-synthesis",
-        route="plan_execute_agent",
-        endpoint=PLAN_EXECUTE_STREAM_ENDPOINT if streaming else PLAN_EXECUTE_QUERY_ENDPOINT,
-        streaming=streaming,
-        collection_name=collection_name,
-        history_count=history_count,
+        trace_context=trace_ctx,
         phase="synthesis",
     )
     prompt = ChatPromptTemplate.from_messages(
@@ -572,8 +575,8 @@ async def _run_plan_execute_agent_query_body(
     history: list[dict[str, str]] | None,
     *,
     streaming: bool,
+    trace_ctx: AgentTraceContext | None = None,
 ) -> dict[str, Any]:
-    history_count = len(history or [])
     trace = [
         "1. Query accepted by Plan-Execute Agent API"
         if not streaming
@@ -582,31 +585,20 @@ async def _run_plan_execute_agent_query_body(
     ]
     debug_events: list[dict[str, Any]] = []
     _append_debug_event(debug_events, "planning", "Planning phase started")
-    plan = _create_plan(
-        question,
-        history,
-        collection_name=collection_name,
-        streaming=streaming,
-    )
+    plan = _create_plan(question, history, trace_ctx=trace_ctx)
     trace.append(f"3. Planning complete: {len(plan)} steps")
     _append_debug_event(debug_events, "plan", "Planning phase complete", plan=_plan_to_strings(plan))
 
     execution = await _execute_plan_steps(
         plan,
+        trace_ctx=trace_ctx,
         search=lambda query: _knowledge_base_search(query, collection_name),
         overview=_collection_overview,
         web_search=run_web_search,
     )
     execution.trace = [*trace, *execution.trace]
     execution.debug_events = [*debug_events, *execution.debug_events]
-    raw_answer = _synthesize_answer(
-        question,
-        plan,
-        execution,
-        collection_name=collection_name,
-        history_count=history_count,
-        streaming=streaming,
-    )
+    raw_answer = _synthesize_answer(question, plan, execution, trace_ctx=trace_ctx)
     answer, needs_human_review, human_review_reason = _apply_grounding_guard(
         raw_answer,
         execution,
@@ -627,34 +619,20 @@ async def run_plan_execute_agent_query(
     collection_name: str | None = None,
     history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    if not is_tracing_enabled():
+    trace_ctx = build_agent_trace_context(
+        route="plan_execute_agent",
+        endpoint=PLAN_EXECUTE_QUERY_ENDPOINT,
+        streaming=False,
+        collection_name=collection_name,
+        history_count=len(history or []),
+    )
+    with agent_request_tracing("plan-execute-query", trace_ctx):
         return await _run_plan_execute_agent_query_body(
             question,
             collection_name,
             history,
             streaming=False,
-        )
-
-    from langsmith.run_helpers import trace
-
-    history_count = len(history or [])
-    with trace(
-        name="plan-execute-query",
-        run_type="chain",
-        metadata=build_run_config(
-            "plan-execute-query",
-            route="plan_execute_agent",
-            endpoint=PLAN_EXECUTE_QUERY_ENDPOINT,
-            streaming=False,
-            collection_name=collection_name,
-            history_count=history_count,
-        ).get("metadata", {}),
-    ):
-        return await _run_plan_execute_agent_query_body(
-            question,
-            collection_name,
-            history,
-            streaming=False,
+            trace_ctx=trace_ctx,
         )
 
 
@@ -662,23 +640,20 @@ async def _stream_plan_execute_agent_query_body(
     question: str,
     collection_name: str | None,
     history: list[dict[str, str]] | None,
+    *,
+    trace_ctx: AgentTraceContext | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    history_count = len(history or [])
     yield {"type": "debug", "data": {"phase": "planning", "message": "Planning phase started"}}
     yield {"type": "trace", "data": "1. Query accepted by Plan-Execute Agent stream API"}
     yield {"type": "trace", "data": "2. Planning phase started"}
-    plan = _create_plan(
-        question,
-        history,
-        collection_name=collection_name,
-        streaming=True,
-    )
+    plan = _create_plan(question, history, trace_ctx=trace_ctx)
     plan_strings = _plan_to_strings(plan)
     yield {"type": "plan", "data": plan_strings}
     yield {"type": "debug", "data": {"phase": "plan", "message": "Planning phase complete", "details": {"plan": plan_strings}}}
 
     execution = await _execute_plan_steps(
         plan,
+        trace_ctx=trace_ctx,
         search=lambda query: _knowledge_base_search(query, collection_name),
         overview=_collection_overview,
         web_search=run_web_search,
@@ -688,14 +663,7 @@ async def _stream_plan_execute_agent_query_body(
     for event in execution.debug_events:
         yield {"type": "debug", "data": event}
 
-    raw_answer = _synthesize_answer(
-        question,
-        plan,
-        execution,
-        collection_name=collection_name,
-        history_count=history_count,
-        streaming=True,
-    )
+    raw_answer = _synthesize_answer(question, plan, execution, trace_ctx=trace_ctx)
     answer, needs_human_review, human_review_reason = _apply_grounding_guard(
         raw_answer,
         execution,
@@ -719,25 +687,18 @@ async def stream_plan_execute_agent_query(
     collection_name: str | None = None,
     history: list[dict[str, str]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    if not is_tracing_enabled():
-        async for event in _stream_plan_execute_agent_query_body(question, collection_name, history):
-            yield event
-        return
-
-    from langsmith.run_helpers import trace
-
-    history_count = len(history or [])
-    with trace(
-        name="plan-execute-stream",
-        run_type="chain",
-        metadata=build_run_config(
-            "plan-execute-stream",
-            route="plan_execute_agent",
-            endpoint=PLAN_EXECUTE_STREAM_ENDPOINT,
-            streaming=True,
-            collection_name=collection_name,
-            history_count=history_count,
-        ).get("metadata", {}),
-    ):
-        async for event in _stream_plan_execute_agent_query_body(question, collection_name, history):
+    trace_ctx = build_agent_trace_context(
+        route="plan_execute_agent",
+        endpoint=PLAN_EXECUTE_STREAM_ENDPOINT,
+        streaming=True,
+        collection_name=collection_name,
+        history_count=len(history or []),
+    )
+    with agent_request_tracing("plan-execute-stream", trace_ctx):
+        async for event in _stream_plan_execute_agent_query_body(
+            question,
+            collection_name,
+            history,
+            trace_ctx=trace_ctx,
+        ):
             yield event

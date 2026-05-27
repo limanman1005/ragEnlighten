@@ -184,7 +184,7 @@ Tavily provider 会把 Tavily `results` 映射为现有的 `title`、`url`、`sn
 
 可为 React Agent 与 Plan-Execute Agent 启用 [LangSmith](https://smith.langchain.com/) tracing，在 UI 中查看 LLM 调用、工具链路与请求元数据。默认关闭，不影响现有 API 行为。
 
-在 `.env` 中配置：
+在 `.env` 中配置（由应用的 `LANGSMITH_*` 变量控制；启用后应用会写入 `LANGCHAIN_TRACING_V2` 等 LangChain 兼容环境变量）：
 
 ```env
 LANGSMITH_TRACING_ENABLED=true
@@ -193,9 +193,13 @@ LANGSMITH_PROJECT=ragEnlighten
 # LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 ```
 
+`LANGSMITH_API_KEY` 为必填项：若只开启 `LANGSMITH_TRACING_ENABLED` 而未配置 API key，服务会记录警告且不会导出 trace。
+
 启动服务后调用 `/api/v1/chat/react-agent`、`/api/v1/chat/react-agent/stream`、`/api/v1/chat/plan-execute-agent` 或 `/api/v1/chat/plan-execute-agent/stream`，trace 会写入上述 project。
 
-在 LangSmith 中可按 metadata 筛选：
+每次 API 请求在 LangSmith 中应呈现为一棵层级 trace：根 run 为 `react-agent-query` / `react-agent-stream` / `plan-execute-query` / `plan-execute-stream`，其下嵌套 planning、execution、step、synthesis 或 LangChain agent 子 run。
+
+在 LangSmith 中可按 metadata 筛选（根 run 与 execution step 子 run 均包含这些字段）：
 
 | 字段 | 含义 |
 |------|------|

@@ -1,4 +1,4 @@
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: LangSmith tracing configuration
 
@@ -44,22 +44,6 @@ When LangSmith tracing is effectively enabled, agent runs SHALL include consiste
 - **THEN** each such trace includes the same `route`, `endpoint`, `streaming`, and `collection_name` metadata as the root request trace
 - **AND** includes `phase=execution` and step fields (`step_id`, `tool_name`) where applicable
 
-### Requirement: React Agent hierarchical traces
-
-The system SHALL nest React Agent LangChain activity under a single root trace per API request when effective tracing is enabled.
-
-#### Scenario: React non-streaming hierarchical trace
-
-- **WHEN** a client calls `POST /api/v1/chat/react-agent` with effective tracing enabled
-- **THEN** LangSmith records a root run for the request
-- **AND** the LangChain agent run appears as a descendant of that root
-
-#### Scenario: React streaming hierarchical trace
-
-- **WHEN** a client calls `POST /api/v1/chat/react-agent/stream` with effective tracing enabled
-- **THEN** LangSmith records a root run for the streaming request
-- **AND** the LangChain agent run appears as a descendant of that root
-
 ### Requirement: Plan-Execute Agent phase visibility in traces
 
 The system SHALL produce LangSmith traces for Plan-Execute Agent requests that expose planning, execution, and synthesis as nested runs under a single root trace per API request.
@@ -76,20 +60,23 @@ The system SHALL produce LangSmith traces for Plan-Execute Agent requests that e
 - **THEN** LangSmith records a root run for the streaming request
 - **AND** planning, execution, and synthesis activity appear as descendant runs of that root
 
-### Requirement: Plan-Execute execution step observability
+## ADDED Requirements
 
-The system SHOULD record Plan-Execute tool execution steps in LangSmith in a way that can be correlated with response `tool_calls`.
+### Requirement: React Agent hierarchical traces
 
-#### Scenario: Execution steps are traceable
+The system SHALL nest React Agent LangChain activity under a single root trace per API request when effective tracing is enabled.
 
-- **WHEN** the Plan-Execute Agent executes one or more plan steps that invoke tools
-- **THEN** LangSmith trace data includes per-step identifiers and tool names for each executed step
-- **AND** step status (success or failure) is observable in the trace
+#### Scenario: React non-streaming hierarchical trace
 
-#### Scenario: Execution steps align with tool_calls
+- **WHEN** a client calls `POST /api/v1/chat/react-agent` with effective tracing enabled
+- **THEN** LangSmith records a root run for the request
+- **AND** the LangChain agent run appears as a descendant of that root
 
-- **WHEN** a Plan-Execute response includes `tool_calls` for executed plan steps
-- **THEN** traced execution steps use tool names and step ordering consistent with the recorded `tool_calls`
+#### Scenario: React streaming hierarchical trace
+
+- **WHEN** a client calls `POST /api/v1/chat/react-agent/stream` with effective tracing enabled
+- **THEN** LangSmith records a root run for the streaming request
+- **AND** the LangChain agent run appears as a descendant of that root
 
 ### Requirement: Accurate Plan-Execute step trace status
 
@@ -100,18 +87,3 @@ The system SHALL NOT record successful Plan-Execute step traces for tools that w
 - **WHEN** a plan step references a tool that is not executed by the Plan-Execute runtime
 - **THEN** LangSmith does not record that step as a successful tool run
 - **AND** any recorded step status reflects `skipped` or the step trace is omitted
-
-### Requirement: Backward compatibility for agent APIs
-
-Enabling LangSmith tracing SHALL NOT change the external behavior of React or Plan-Execute agent endpoints.
-
-#### Scenario: Response shape unchanged
-
-- **WHEN** tracing is enabled and a client calls any React or Plan-Execute agent endpoint
-- **THEN** the response remains `QueryResponse`-compatible for non-streaming calls
-- **AND** SSE streaming event types and framing remain unchanged
-
-#### Scenario: Agent semantics unchanged
-
-- **WHEN** tracing is enabled
-- **THEN** tool selection, plan generation, grounding guards, and validation behavior remain the same as when tracing is disabled
