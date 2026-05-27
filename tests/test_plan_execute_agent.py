@@ -155,6 +155,34 @@ class PlanExecutionOrderingTests(unittest.TestCase):
             any("Tool web_search returned a result" in item for item in execution.trace)
         )
 
+    def test_skips_unsupported_plan_tools_without_tool_calls(self):
+        steps = [
+            PlanStep("1", "Unsupported action", "unknown_tool", "do something"),
+            PlanStep("2", "Search knowledge base", "knowledge_base_search", "alpha"),
+            PlanStep("3", "Synthesize answer", "answer_synthesis", ""),
+        ]
+
+        async def run():
+            def search(query: str):
+                return "search output", []
+
+            def overview():
+                return "overview output"
+
+            return await _execute_plan_steps(steps, search=search, overview=overview)
+
+        execution = asyncio.run(run())
+
+        self.assertEqual([call["name"] for call in execution.tool_calls], ["knowledge_base_search"])
+        self.assertTrue(any("Skipped plan step 1" in item for item in execution.trace))
+        self.assertTrue(
+            any(
+                event.get("details", {}).get("status") == "skipped"
+                for event in execution.debug_events
+                if event.get("phase") == "execution"
+            )
+        )
+
     def test_web_search_failure_is_recorded_without_supporting_context(self):
         steps = [PlanStep("1", "Search web", "web_search", "external topic")]
 

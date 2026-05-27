@@ -12,6 +12,9 @@ langchain-text-splitters>=0.3.0
 # LangGraph
 langgraph>=0.2.0
 
+# LangSmith tracing
+langsmith>=0.1.0
+
 # Vector store
 chromadb>=0.5.0
 
@@ -29,3 +32,7 @@ streamlit>=1.44.0
 
 # Alibaba DashScope SDK
 dashscope>=1.20.0
+
+# MCP tool server / client
+mcp>=1.2.0
+langchain-mcp-adapters>=0.1.0

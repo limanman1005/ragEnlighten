@@ -58,7 +58,25 @@ except ModuleNotFoundError:
         raise RuntimeError("LangChain dependencies are required to create the React Agent runtime.")
 
 from app.core.config import settings
-from app.services.web_search import run_web_search
+from app.core.tracing import (
+    REACT_AGENT_QUERY_ENDPOINT,
+    REACT_AGENT_STREAM_ENDPOINT,
+    AgentTraceContext,
+    agent_request_tracing,
+    build_agent_trace_context,
+    build_run_config,
+)
+from app.services.agent_tools import (
+    CollectionOverviewRequest,
+    KnowledgeBaseSearchRequest,
+    WebSearchToolRequest,
+    apply_tool_output_to_documents,
+    merge_documents,
+    run_collection_overview,
+    run_knowledge_base_search,
+    run_web_search_tool,
+)
+from app.services.mcp_client import load_mcp_tools
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -207,38 +225,7 @@ def _stringify_content(content: Any) -> str:
 
 
 def _merge_documents(existing: list[Document], incoming: list[Document]) -> list[Document]:
-    merged = list(existing)
-    index_by_key = {
-        (
-            doc.metadata.get("source"),
-            doc.metadata.get("page"),
-            doc.metadata.get("start_index"),
-            doc.page_content,
-        ): idx
-        for idx, doc in enumerate(merged)
-    }
-
-    for doc in incoming:
-        key = (
-            doc.metadata.get("source"),
-            doc.metadata.get("page"),
-            doc.metadata.get("start_index"),
-            doc.page_content,
-        )
-        existing_index = index_by_key.get(key)
-        if existing_index is None:
-            index_by_key[key] = len(merged)
-            merged.append(doc)
-            continue
-
-        existing_score = merged[existing_index].metadata.get("retrieval_score")
-        incoming_score = doc.metadata.get("retrieval_score")
-        if incoming_score is not None and (
-            existing_score is None or float(incoming_score) > float(existing_score)
-        ):
-            merged[existing_index] = doc
-
-    return merged
+    return merge_documents(existing, incoming)
 
 
 def _format_documents(docs: list[Document]) -> str:
@@ -523,112 +510,108 @@ def _extract_reasoning_content(messages: list[BaseMessage]) -> str | None:
     return None
 
 
-def _build_agent_runtime(collection_name: str | None = None):
-    documents: list[Document] = []
-    resolved_collection = collection_name or settings.chroma_collection_name
-    logger.info("[react_agent.runtime] build collection=%s", resolved_collection)
-
+def _build_local_tools(
+    documents: list[Document],
+    collection_name: str | None,
+    resolved_collection: str,
+) -> list[Any]:
     @tool
-    def knowledge_base_search(query: str) -> str:
+    def knowledge_base_search(
+        query: str,
+        source_types: list[str] | None = None,
+        top_k: int | None = None,
+    ) -> str:
         """Search the indexed knowledge base for evidence relevant to the user's question."""
         nonlocal documents
-        from app.services.indexing import get_parent_chunks_by_ids, get_vectorstore
-
         logger.info(
-            "[react_agent.tool.search] collection=%s query=%s",
+            "[react_agent.tool.search] collection=%s query=%s source_types=%s top_k=%s",
             resolved_collection,
             query[:120],
+            source_types,
+            top_k,
         )
-        vectorstore = get_vectorstore(collection_name)
-        scored_docs = vectorstore.similarity_search_with_relevance_scores(
-            query=query,
-            k=settings.retriever_top_k,
-            filter={"chunk_level": "child"},
-        )
-        tool_docs: list[Document] = []
-        parent_chunk_ids: list[str] = []
-        for doc, score in scored_docs:
-            metadata = dict(doc.metadata)
-            metadata["retrieval_score"] = round(float(score), 4)
-            metadata["retrieval_hop"] = 1
-            tool_docs.append(Document(page_content=doc.page_content, metadata=metadata))
-            parent_chunk_id = str(metadata.get("parent_chunk_id") or "").strip()
-            if parent_chunk_id:
-                parent_chunk_ids.append(parent_chunk_id)
+        try:
+            request = KnowledgeBaseSearchRequest(
+                query=query,
+                collection_name=collection_name,
+                source_types=source_types,
+                top_k=top_k,
+                max_retries=settings.agent_tool_default_max_retries,
+            )
+        except Exception as exc:
+            return f"Knowledge base search failed: {exc}"
 
-        parent_docs = get_parent_chunks_by_ids(parent_chunk_ids, collection_name)
-        parent_by_id = {
-            str(doc.metadata.get("parent_chunk_id") or ""): doc
-            for doc in parent_docs
-            if doc.metadata.get("parent_chunk_id")
-        }
-        grouped_children: dict[str, list[Document]] = {}
-        for tool_doc in tool_docs:
-            parent_chunk_id = str(tool_doc.metadata.get("parent_chunk_id") or "")
-            grouped_children.setdefault(parent_chunk_id, []).append(tool_doc)
-
-        enriched_tool_docs: list[Document] = []
-        for tool_doc in tool_docs:
-            metadata = dict(tool_doc.metadata)
-            parent_chunk_id = str(metadata.get("parent_chunk_id") or "")
-            parent_doc = parent_by_id.get(parent_chunk_id)
-            if parent_doc is not None:
-                metadata["parent_title"] = parent_doc.metadata.get("title") or parent_doc.metadata.get("section_path")
-                metadata["parent_section_path"] = parent_doc.metadata.get("section_path") or parent_doc.metadata.get("parent_section_path")
-                metadata["parent_content_preview"] = (
-                    parent_doc.metadata.get("content_preview") or parent_doc.page_content
-                )[: settings.rewrite_context_chars]
-                metadata["matched_child_count"] = len(grouped_children.get(parent_chunk_id, []))
-            enriched_tool_docs.append(Document(page_content=tool_doc.page_content, metadata=metadata))
-
-        retrieval_audit = _build_retrieval_audit_text(enriched_tool_docs, parent_docs)
-        merged_documents = _merge_documents(documents, enriched_tool_docs)
-        documents.clear()
-        documents.extend(merged_documents)
+        result = run_knowledge_base_search(request)
+        if result.sources:
+            merged_documents = _merge_documents(documents, result.to_documents())
+            documents.clear()
+            documents.extend(merged_documents)
         logger.info(
-            "[react_agent.tool.search] complete results=%s parent_results=%s merged_documents=%s\n%s",
-            len(enriched_tool_docs),
-            len(parent_docs),
+            "[react_agent.tool.search] status=%s results=%s merged_documents=%s",
+            result.status,
+            len(result.sources),
             len(documents),
-            retrieval_audit,
         )
-        return retrieval_audit + "\n\n" + _format_parent_child_documents(enriched_tool_docs, parent_docs)
+        return result.content
 
     @tool
     def collection_overview() -> str:
         """Return internal metadata about the configured models and available collections."""
-        from app.services.indexing import list_collections
-
         logger.info("[react_agent.tool.meta] collection=%s", resolved_collection)
-        collections = list_collections()
-        summary = ", ".join(f"{item['name']}({item['count']})" for item in collections[:10]) or "none"
-        return (
-            f"Active LLM model: {settings.llm_model}\n"
-            f"Active embedding model: {settings.embedding_model}\n"
-            f"Default collection: {settings.chroma_collection_name}\n"
-            f"Requested collection: {resolved_collection}\n"
-            f"Collections: {summary}"
+        request = CollectionOverviewRequest(
+            collection_name=collection_name,
+            max_retries=settings.agent_tool_default_max_retries,
         )
+        return run_collection_overview(request).content
 
     @tool
     def web_search(query: str) -> str:
         """Search the web for external or current information beyond the indexed knowledge base."""
         nonlocal documents
-
         logger.info("[react_agent.tool.web_search] query=%s", query[:120])
-        output, web_docs = run_web_search(query)
-        if not web_docs:
-            logger.warning("[react_agent.tool.web_search] no_results output=%s", output[:200])
-            return output
-        merged_documents = _merge_documents(documents, web_docs)
-        documents.clear()
-        documents.extend(merged_documents)
+        request = WebSearchToolRequest(
+            query=query,
+            max_retries=settings.agent_tool_default_max_retries,
+        )
+        result = run_web_search_tool(request)
+        if result.sources:
+            merged_documents = _merge_documents(documents, result.to_documents())
+            documents.clear()
+            documents.extend(merged_documents)
         logger.info(
-            "[react_agent.tool.web_search] complete results=%s merged_documents=%s",
-            len(web_docs),
+            "[react_agent.tool.web_search] status=%s results=%s merged_documents=%s",
+            result.status,
+            len(result.sources),
             len(documents),
         )
-        return output
+        return result.content
+
+    return [knowledge_base_search, collection_overview, web_search]
+
+
+async def _build_agent_runtime(collection_name: str | None = None):
+    documents: list[Document] = []
+    resolved_collection = collection_name or settings.chroma_collection_name
+    logger.info(
+        "[react_agent.runtime] build collection=%s mcp_enabled=%s",
+        resolved_collection,
+        settings.mcp_enabled,
+    )
+
+    local_tools = _build_local_tools(documents, collection_name, resolved_collection)
+    tool_names = [getattr(tool, "name", "unknown") for tool in local_tools]
+    mcp_load_error: str | None = None
+    tools = local_tools
+
+    if settings.mcp_enabled:
+        mcp_tools, mcp_load_error = await load_mcp_tools()
+        if mcp_tools:
+            tools = mcp_tools
+            tool_names = [getattr(tool, "name", "unknown") for tool in tools]
+        elif settings.mcp_fallback_to_local:
+            logger.warning("[react_agent.runtime] mcp_fallback local_tools=%s error=%s", len(local_tools), mcp_load_error)
+        else:
+            raise RuntimeError(mcp_load_error or "MCP tool loading failed")
 
     prompt = (
         "You are a ReAct-style question answering agent for a RAG system. "
@@ -640,12 +623,12 @@ def _build_agent_runtime(collection_name: str | None = None):
     )
     agent = create_agent(
         model=_get_llm(),
-        tools=[knowledge_base_search, collection_overview, web_search],
+        tools=tools,
         system_prompt=prompt,
         name="rag_react_agent",
     )
-    logger.info("[react_agent.runtime] ready tools=%s", 3)
-    return agent, documents
+    logger.info("[react_agent.runtime] ready tools=%s", len(tools))
+    return agent, documents, tool_names, mcp_load_error
 
 
 def _build_react_agent_result(
@@ -702,6 +685,29 @@ async def run_react_agent_query(
     history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Answer a question with a ReAct-style agent loop backed by knowledge-base tools."""
+    trace_ctx = build_agent_trace_context(
+        route="react_agent",
+        endpoint=REACT_AGENT_QUERY_ENDPOINT,
+        streaming=False,
+        collection_name=collection_name,
+        history_count=len(history or []),
+    )
+    with agent_request_tracing("react-agent-query", trace_ctx):
+        return await _run_react_agent_query_body(
+            question,
+            collection_name,
+            history,
+            trace_ctx=trace_ctx,
+        )
+
+
+async def _run_react_agent_query_body(
+    question: str,
+    collection_name: str | None,
+    history: list[dict[str, str]] | None,
+    *,
+    trace_ctx: AgentTraceContext,
+) -> dict[str, Any]:
     trace = ["1. Query accepted by React Agent API"]
     debug_events: list[dict[str, Any]] = []
     _append_debug_event(
@@ -717,12 +723,15 @@ async def run_react_agent_query(
         len(history or []),
         question[:120],
     )
-    agent, documents = _build_agent_runtime(collection_name)
+    agent, documents, tool_names, mcp_load_error = await _build_agent_runtime(collection_name)
+    runtime_details: dict[str, Any] = {"tools": tool_names}
+    if mcp_load_error:
+        runtime_details["mcp_load_error"] = mcp_load_error
     _append_debug_event(
         debug_events,
         "runtime_ready",
         "Agent runtime initialized",
-        tools=["knowledge_base_search", "collection_overview", "web_search"],
+        **runtime_details,
     )
 
     model_input = {"messages": _build_messages(question, history)}
@@ -732,7 +741,11 @@ async def run_react_agent_query(
         "Starting agent reasoning loop",
         input_messages=len(model_input["messages"]),
     )
-    result = await agent.ainvoke(model_input)
+    run_config = build_run_config(
+        "react-agent-query",
+        trace_context=trace_ctx,
+    )
+    result = await agent.ainvoke(model_input, config=run_config)
     messages = result.get("messages", [])
     logger.info("[react_agent.query] agent_returned_messages=%s", len(messages))
     _append_debug_event(
@@ -795,7 +808,11 @@ async def run_react_agent_query(
                 },
             )
             entry["status"] = "success"
-            entry["output_summary"] = _stringify_content(message.content)[:1600]
+            raw_output = message.content
+            output_summary = apply_tool_output_to_documents(documents, raw_output)
+            if not output_summary:
+                output_summary = _stringify_content(raw_output)
+            entry["output_summary"] = output_summary[:1600]
             tool_calls.append(entry)
             observe_round = int(entry.get("round_number", "0") or 0) or None
             _append_debug_event(
@@ -907,6 +924,30 @@ async def stream_react_agent_query(
     history: list[dict[str, str]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream React Agent events and emit a final structured payload."""
+    trace_ctx = build_agent_trace_context(
+        route="react_agent",
+        endpoint=REACT_AGENT_STREAM_ENDPOINT,
+        streaming=True,
+        collection_name=collection_name,
+        history_count=len(history or []),
+    )
+    with agent_request_tracing("react-agent-stream", trace_ctx):
+        async for event in _stream_react_agent_query_body(
+            question,
+            collection_name,
+            history,
+            trace_ctx=trace_ctx,
+        ):
+            yield event
+
+
+async def _stream_react_agent_query_body(
+    question: str,
+    collection_name: str | None,
+    history: list[dict[str, str]] | None,
+    *,
+    trace_ctx: AgentTraceContext,
+) -> AsyncIterator[dict[str, Any]]:
     trace = ["1. Query accepted by React Agent stream API"]
     debug_events: list[dict[str, Any]] = []
     _append_debug_event(
@@ -925,12 +966,15 @@ async def stream_react_agent_query(
     yield {"type": "trace", "data": trace[-1]}
     yield {"type": "debug", "data": debug_events[-1]}
 
-    agent, documents = _build_agent_runtime(collection_name)
+    agent, documents, tool_names, mcp_load_error = await _build_agent_runtime(collection_name)
+    runtime_details: dict[str, Any] = {"tools": tool_names}
+    if mcp_load_error:
+        runtime_details["mcp_load_error"] = mcp_load_error
     _append_debug_event(
         debug_events,
         "runtime_ready",
         "Agent runtime initialized",
-        tools=["knowledge_base_search", "collection_overview", "web_search"],
+        **runtime_details,
     )
     yield {"type": "debug", "data": debug_events[-1]}
     pending_calls: dict[str, dict[str, str]] = {}
@@ -950,9 +994,14 @@ async def stream_react_agent_query(
     )
     yield {"type": "debug", "data": debug_events[-1]}
 
+    stream_config = build_run_config(
+        "react-agent-stream",
+        trace_context=trace_ctx,
+    )
     async for event in agent.astream_events(
         {"messages": input_messages},
         version="v2",
+        config=stream_config,
     ):
         event_name = event.get("event", "")
         data = event.get("data", {}) or {}
@@ -1010,7 +1059,11 @@ async def stream_react_agent_query(
 
         if event_name == "on_tool_end":
             tool_name = str(event.get("name") or "unknown_tool")
-            output_summary = _stringify_content(data.get("output"))[:1600]
+            raw_output = data.get("output")
+            output_summary = apply_tool_output_to_documents(documents, raw_output)
+            if not output_summary:
+                output_summary = _stringify_content(raw_output)
+            output_summary = output_summary[:1600]
             matching_id = None
             for call_id, entry in pending_calls.items():
                 if entry["name"] == tool_name:
