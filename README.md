@@ -347,3 +347,46 @@ curl -X POST http://localhost:8000/api/v1/query \
 | `APP_HOST` | `0.0.0.0` | 服务监听地址 |
 | `APP_PORT` | `8000` | 服务监听端口 |
 | `APP_RELOAD` | `false` | 是否开启热重载（开发模式） |
+
+---
+
+## 基础版离线评测（ReAct / Plan-Execute）
+
+项目提供了一个轻量离线评测脚本，可在同一批测试样例上对比 ReAct 和 Plan-Execute 两种模式，输出可回归的 JSON/CSV 结果。
+
+### 评测数据
+
+- 数据文件：`evals/baseline_cases.jsonl`
+- 字段说明：`evals/README.md`
+- 每条样例至少包含：`case_id`、`question`
+- 可选标签：`expected_tools`、`should_be_grounded`、`should_refuse_when_no_evidence`
+
+### 运行命令
+
+先确保 FastAPI 服务已启动（默认 `http://127.0.0.1:8000`），然后执行：
+
+```bash
+python scripts/run_baseline_eval.py --output-dir evals/results/latest --export-csv
+```
+
+常用参数：
+
+- `--dataset`：指定评测集路径（默认 `evals/baseline_cases.jsonl`）
+- `--base-url`：服务地址（默认 `http://127.0.0.1:8000`）
+- `--mode react --mode plan_execute`：仅评测指定模式（默认两个都跑）
+- `--timeout-seconds`：单次请求超时
+
+输出文件：
+
+- `results.json`：逐 case + 逐 mode 详细结果
+- `summary.json`：按 mode 聚合指标
+- `results.csv`：可选，便于人工筛查
+
+### 指标解释（基础版）
+
+- `request_success_rate`：请求成功率（HTTP/运行异常会计入失败）
+- `tool_expectation_hit_rate`：`expected_tools` 与实际 `tool_calls` 的命中率
+- `grounding_pass_rate`：基于 `validation` 与 `sources` 的 grounding 通过率
+- `no_evidence_answer_rate`：在应拒答场景中，无证据仍给出事实性答案的比例（越低越好）
+
+当 LangSmith tracing 已启用时，评测结果会尽量携带可关联的 trace 信息；未启用时评测流程仍可独立运行。
