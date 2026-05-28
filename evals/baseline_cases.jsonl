@@ -1,0 +1,5 @@
+{"case_id":"kb-grounded-001","question":"总结知识库中候选人的核心技术方向","collection_name":"resume_bank","expected_tools":["knowledge_base_search"],"should_be_grounded":true}
+{"case_id":"web-required-001","question":"最近一周关于RAG评测有哪些新趋势？","expected_tools":["web_search"],"should_be_grounded":true}
+{"case_id":"metadata-001","question":"当前默认集合和模型配置是什么？","expected_tools":["collection_overview"],"should_be_grounded":true}
+{"case_id":"no-evidence-guard-001","question":"这个知识库里没有提到的公司融资细节是什么？","expected_tools":["knowledge_base_search"],"should_be_grounded":false,"should_refuse_when_no_evidence":true}
+{"case_id":"multitool-001","question":"先从知识库总结候选人项目，再补充行业最新公开动态","collection_name":"resume_bank","expected_tools":["knowledge_base_search","web_search"],"should_be_grounded":true}
