@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.deepseek.com/v1"
     llm_model: str = "deepseek-chat"
 
+    # SerpApi web search (Hello Agents / tool demos)
+    serpapi_api_key: str = ""
+
     # Embeddings
     embedding_api_key: str = Field(
         default="",
